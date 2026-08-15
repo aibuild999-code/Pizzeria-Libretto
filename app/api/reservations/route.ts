@@ -3,7 +3,6 @@ import { z } from "zod";
 import { createServerSupabase } from "@/lib/supabase/server";
 
 const createSchema = z.object({ customer_name: z.string().trim().min(1).max(120), customer_phone: z.string().trim().min(7).max(30), party_size: z.number().int().min(1).max(50), requested_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), requested_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/), customer_notes: z.string().max(1000).optional(), source: z.string().max(50).optional() });
-
 type RestaurantScope = { id: string; max_online_party_size: number };
 type LocationScope = { id: string };
 
@@ -21,9 +20,13 @@ const scope = async () => {
 export async function GET() {
   try {
     const { supabase, restaurantId, locationId } = await scope();
-    const { data, error } = await supabase.from("reservations").select("*, reservation_events(*)").eq("restaurant_id", restaurantId).eq("location_id", locationId).order("requested_date", { ascending: true }).order("requested_time", { ascending: true });
+    const { data: reservations, error } = await supabase.from("reservations").select("*").eq("restaurant_id", restaurantId).eq("location_id", locationId).order("requested_date", { ascending: true }).order("requested_time", { ascending: true });
     if (error) throw error;
-    return NextResponse.json({ reservations: data ?? [] });
+    const rows = reservations ?? [];
+    const reservationIds = rows.map((reservation) => reservation.id);
+    const { data: events, error: eventError } = reservationIds.length ? await supabase.from("reservation_events").select("*").in("reservation_id", reservationIds).order("created_at", { ascending: true }) : { data: [], error: null };
+    if (eventError) throw eventError;
+    return NextResponse.json({ reservations: rows.map((reservation) => ({ ...reservation, reservation_events: (events ?? []).filter((event) => event.reservation_id === reservation.id) })) });
   } catch (error) {
     console.error("GET /api/reservations", error);
     return NextResponse.json({ error: "Unable to load reservations." }, { status: 500 });
