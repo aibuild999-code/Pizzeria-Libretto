@@ -2,7 +2,16 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { createServerSupabase } from "@/lib/supabase/server";
 
-const createSchema = z.object({ customer_name: z.string().trim().min(1).max(120), customer_phone: z.string().trim().min(7).max(30), party_size: z.number().int().min(1).max(50), requested_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), requested_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/), customer_notes: z.string().max(1000).optional(), source: z.string().max(50).optional() });
+const createSchema = z.object({
+  customer_name: z.string().trim().min(1).max(120),
+  customer_phone: z.string().trim().min(7).max(30),
+  customer_email: z.string().trim().email().max(320).optional(),
+  party_size: z.number().int().min(1).max(50),
+  requested_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  requested_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
+  customer_notes: z.string().max(1000).optional(),
+  source: z.string().max(50).optional(),
+});
 type RestaurantScope = { id: string; max_online_party_size: number };
 type LocationScope = { id: string };
 
@@ -39,8 +48,35 @@ export async function POST(request: Request) {
     if (!parsed.success) return NextResponse.json({ error: "Invalid reservation payload.", details: parsed.error.flatten() }, { status: 400 });
     const { supabase, restaurantId, locationId, maxParty } = await scope();
     if (parsed.data.party_size > maxParty) return NextResponse.json({ error: `Maximum online party size is ${maxParty}.` }, { status: 400 });
-    const { data, error } = await supabase.rpc("create_reservation_atomic", { p_restaurant_id: restaurantId, p_location_id: locationId, p_customer_name: parsed.data.customer_name, p_customer_phone: parsed.data.customer_phone, p_party_size: parsed.data.party_size, p_requested_date: parsed.data.requested_date, p_requested_time: parsed.data.requested_time, p_customer_notes: parsed.data.customer_notes ?? null, p_source: parsed.data.source ?? "ai_phone" });
+
+    const { error: customerError } = await supabase.from("customers").upsert({
+      restaurant_id: restaurantId,
+      name: parsed.data.customer_name,
+      phone: parsed.data.customer_phone,
+      email: parsed.data.customer_email ?? null,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "restaurant_id,phone" });
+    if (customerError) throw customerError;
+
+    const { data, error } = await supabase.rpc("create_reservation_atomic", {
+      p_restaurant_id: restaurantId,
+      p_location_id: locationId,
+      p_customer_name: parsed.data.customer_name,
+      p_customer_phone: parsed.data.customer_phone,
+      p_party_size: parsed.data.party_size,
+      p_requested_date: parsed.data.requested_date,
+      p_requested_time: parsed.data.requested_time,
+      p_customer_notes: parsed.data.customer_notes ?? null,
+      p_source: parsed.data.source ?? "ai_phone",
+    });
     if (error) throw error;
+
+    const reservationId = data && typeof data === "object" && "id" in data ? String((data as { id: string }).id) : null;
+    if (reservationId && parsed.data.customer_email) {
+      const { error: reservationEmailError } = await supabase.from("reservations").update({ customer_email: parsed.data.customer_email }).eq("id", reservationId).eq("restaurant_id", restaurantId);
+      if (reservationEmailError) throw reservationEmailError;
+    }
+
     return NextResponse.json({ reservation: data }, { status: 201 });
   } catch (error) {
     console.error("POST /api/reservations", error);
