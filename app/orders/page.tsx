@@ -1,4 +1,6 @@
 import { createServerSupabase } from "@/lib/supabase/server";
 import { OrderBoard } from "@/components/order-board";
 
+export const dynamic = "force-dynamic";
+
 export default async function OrdersPage(){const supabase=createServerSupabase();const {data:restaurant}=await supabase.from("restaurants").select("id").limit(1).single();const {data:location}=restaurant?await supabase.from("restaurant_locations").select("id").eq("restaurant_id",restaurant.id).eq("is_active",true).limit(1).single():{data:null};const {data}=restaurant&&location?await supabase.from("orders").select("*, order_items(*)").eq("restaurant_id",restaurant.id).eq("location_id",location.id).order("created_at",{ascending:false}):{data:[]};return <div><div className="mb-8"><p className="text-sm font-medium text-slate-500">Orders</p><h1 className="mt-1 text-3xl font-bold tracking-tight">Orders</h1><p className="mt-2 text-slate-500">Live orders from Supabase. Status changes are validated server-side.</p></div><OrderBoard initial={(data??[]) as never[]}/></div>}
