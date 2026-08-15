@@ -5,6 +5,8 @@ import { createServerSupabase } from "@/lib/supabase/server";
 const schema = z.object({ status: z.enum(["pending", "preparing", "ready", "completed", "cancelled"]) });
 const transitions: Record<string, string[]> = { pending: ["preparing", "cancelled"], preparing: ["ready", "cancelled"], ready: ["completed", "cancelled"], completed: [], cancelled: [] };
 
+type OrderScope = { id: string; status: string; restaurant_id: string; location_id: string };
+
 export async function PATCH(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await context.params;
@@ -12,8 +14,9 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     const parsed = schema.safeParse(await request.json());
     if (!parsed.success) return NextResponse.json({ error: "Invalid status." }, { status: 400 });
     const supabase = createServerSupabase();
-    const { data: order, error: findError } = await supabase.from("orders").select("id,status,restaurant_id,location_id").eq("id", id).limit(1).single();
-    if (findError || !order) return NextResponse.json({ error: "Order not found." }, { status: 404 });
+    const { data: rawOrder, error: findError } = await supabase.from("orders").select("id,status,restaurant_id,location_id").eq("id", id).limit(1).single();
+    if (findError || !rawOrder) return NextResponse.json({ error: "Order not found." }, { status: 404 });
+    const order = rawOrder as OrderScope;
     if (!transitions[order.status]?.includes(parsed.data.status)) return NextResponse.json({ error: `Cannot move order from ${order.status} to ${parsed.data.status}.` }, { status: 409 });
     const update: Record<string, string> = { status: parsed.data.status, updated_at: new Date().toISOString() };
     if (parsed.data.status === "completed") update.completed_at = new Date().toISOString();
