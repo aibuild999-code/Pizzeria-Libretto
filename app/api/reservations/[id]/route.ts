@@ -1,0 +1,6 @@
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { createServerSupabase } from "@/lib/supabase/server";
+
+const schema=z.object({status:z.enum(["pending","confirmed","alternative_proposed","declined","completed","cancelled"]),note:z.string().max(1000).optional()});
+export async function PATCH(request:Request,context:{params:Promise<{id:string}>}){try{const {id}=await context.params;if(!z.string().uuid().safeParse(id).success)return NextResponse.json({error:"Invalid reservation id."},{status:400});const parsed=schema.safeParse(await request.json());if(!parsed.success)return NextResponse.json({error:"Invalid reservation status."},{status:400});const supabase=createServerSupabase();const {data,error}=await supabase.rpc("update_reservation_status",{p_reservation_id:id,p_status:parsed.data.status,p_actor_type:"staff",p_note:parsed.data.note??null});if(error){if(error.message.includes("not found"))return NextResponse.json({error:"Reservation not found."},{status:404});throw error;}return NextResponse.json({reservation:data});}catch(error){console.error("PATCH /api/reservations/[id]",error);return NextResponse.json({error:"Unable to update reservation."},{status:500});}}
