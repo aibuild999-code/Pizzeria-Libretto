@@ -63,7 +63,7 @@ function userError(error: unknown) {
     ["selection count", "The number of selections is outside the allowed range."], ["invalid or unavailable size", "That size is not available for this item."],
     ["invalid or unavailable modifier", "That modifier is not available for this item."], ["maximum online party size", "That party size is above the restaurant's online reservation limit."],
     ["does not belong", "I could not verify that record belongs to this customer."], ["can no longer be modified", "This order can no longer be modified."],
-    ["cannot be cancelled", "This order can no longer be cancelled."], ["outside restaurant hours", "The requested time is outside restaurant hours."],
+    ["can no longer be cancelled", "This order can no longer be cancelled."], ["cannot be cancelled", "This order can no longer be cancelled."], ["outside restaurant hours", "The requested time is outside restaurant hours."],
   ];
   const lower = raw.toLowerCase();
   const match = known.find(([needle]) => lower.includes(needle));
@@ -112,6 +112,21 @@ async function restaurantInfo(supabase: any, restaurantId: string, locationId: s
   return { restaurant, location, settings, hours: hours ?? [] };
 }
 
+async function reservationAvailability(supabase: any, restaurantId: string, locationId: string, input: { party_size: number; requested_date: string; requested_time: string }, info?: any) {
+  const restaurantInfoData = info ?? await restaurantInfo(supabase, restaurantId, locationId);
+  if (!restaurantInfoData.settings?.reservations_enabled) return { available:false, reason:"reservations_disabled" };
+  if (input.party_size > Number(restaurantInfoData.restaurant.max_online_party_size ?? 0)) return { available:false, reason:"party_size_limit", max_party_size:restaurantInfoData.restaurant.max_online_party_size };
+  const day = new Date(`${input.requested_date}T12:00:00Z`).getUTCDay();
+  const hour = input.requested_time.slice(0,5);
+  const hours = (restaurantInfoData.hours ?? []).filter((h:any)=>h.day_of_week===day);
+  if (!hours.length || hours.every((h:any)=>h.is_closed || !h.opens_at || !h.closes_at || !(hour >= h.opens_at.slice(0,5) && hour < h.closes_at.slice(0,5)))) return { available:false, reason:"outside_restaurant_hours" };
+  const { data: existing } = await supabase.from("reservations").select("party_size,status,requested_time").eq("restaurant_id",restaurantId).eq("location_id",locationId).eq("requested_date",input.requested_date).in("status",["pending","confirmed","alternative_proposed"]);
+  const capacity = restaurantInfoData.settings.reservation_capacity == null ? null : Number(restaurantInfoData.settings.reservation_capacity);
+  const used = (existing ?? []).filter((r:any)=>r.requested_time?.slice(0,5)===hour).reduce((sum:number,r:any)=>sum+Number(r.party_size),0);
+  const capacityAvailable = capacity == null ? null : used + input.party_size <= capacity;
+  return { available:capacityAvailable === null ? true : capacityAvailable, capacity_configured:capacity!==null, capacity_remaining:capacity===null ? null : Math.max(capacity-used,0), requires_manual_confirmation:!restaurantInfoData.settings.reservations_auto_confirm || input.party_size > Number(restaurantInfoData.settings.reservations_max_auto_party_size ?? 0), requested_date:input.requested_date, requested_time:input.requested_time };
+}
+
 export async function handleAiRequest(request: Request, operation: string[]) {
   const auth = await authorize(request);
   if (auth.error) return auth.error;
@@ -121,162 +136,46 @@ export async function handleAiRequest(request: Request, operation: string[]) {
 
   try {
     if (op === "restaurant") return response(await restaurantInfo(supabase, restaurantId, locationId));
-
     if (op === "menu") {
       const input = z.object({ category: z.string().trim().max(100).optional(), item: z.string().trim().max(120).optional(), search: z.string().trim().max(120).optional(), modifier_group: z.string().trim().max(120).optional() }).parse(args);
       const info = await restaurantInfo(supabase, restaurantId, locationId);
       let categoryQuery = supabase.from("menu_categories").select("id,name").eq("restaurant_id", restaurantId).eq("is_active", true).order("display_order");
       if (input.category) categoryQuery = categoryQuery.ilike("name", `%${input.category}%`);
-      const { data: categories, error: categoryError } = await categoryQuery;
-      if (categoryError) throw categoryError;
-      const categoryIds = (categories ?? []).map((c: any) => c.id);
-      let itemQuery = supabase.from("menu_items").select("id,category_id,name,description,price,dietary_tags,is_available,item_type").in("category_id", categoryIds.length ? categoryIds : ["00000000-0000-0000-0000-000000000000"]).order("display_order").limit(30);
-      if (input.item) itemQuery = itemQuery.ilike("name", `%${input.item}%`); else if (input.search) itemQuery = itemQuery.or(`name.ilike.%${input.search}%,description.ilike.%${input.search}%`);
-      const { data: items, error: itemError } = await itemQuery;
-      if (itemError) throw itemError;
-      const itemIds = (items ?? []).map((i: any) => i.id);
-      const [{ data: sizes }, { data: links }, { data: groups }] = await Promise.all([
-        supabase.from("menu_item_sizes").select("id,menu_item_id,name,price,is_available").in("menu_item_id", itemIds.length ? itemIds : ["00000000-0000-0000-0000-000000000000"]).order("display_order"),
-        supabase.from("menu_item_modifier_groups").select("menu_item_id,modifier_group_id,min_selections,max_selections,required,free_selections").in("menu_item_id", itemIds.length ? itemIds : ["00000000-0000-0000-0000-000000000000"]),
-        supabase.from("modifier_groups").select("id,name,description,selection_type,min_selections,max_selections").eq("restaurant_id", restaurantId).eq("is_active", true).order("display_order"),
-      ]);
-      const groupIds = (links ?? []).map((l: any) => l.modifier_group_id);
-      let modifierQuery = supabase.from("modifiers").select("id,modifier_group_id,name,description,price_delta,max_quantity,is_available,action").in("modifier_group_id", groupIds.length ? groupIds : ["00000000-0000-0000-0000-000000000000"]).order("display_order");
-      if (input.modifier_group) modifierQuery = modifierQuery.ilike("name", `%${input.modifier_group}%`);
-      const { data: modifiers, error: modifierError } = await modifierQuery;
-      if (modifierError) throw modifierError;
-      const categoryMap = new Map((categories ?? []).map((c: any) => [c.id, c.name]));
-      return response({ restaurant: { id: info.restaurant.id, name: info.restaurant.name }, categories: (categories ?? []).map((c: any) => ({ id: c.id, name: c.name })), items: (items ?? []).map((item: any) => ({ id: item.id, category: categoryMap.get(item.category_id), name: item.name, description: item.description, base_price: item.price, dietary_tags: item.dietary_tags, available: item.is_available, item_type: item.item_type, sizes: (sizes ?? []).filter((s: any) => s.menu_item_id === item.id), modifier_groups: (links ?? []).filter((l: any) => l.menu_item_id === item.id).map((l: any) => ({ ...l, group: (groups ?? []).find((g: any) => g.id === l.modifier_group_id) ?? null, modifiers: (modifiers ?? []).filter((m: any) => m.modifier_group_id === l.modifier_group_id) })) })) });
+      const { data: categories, error: categoryError } = await categoryQuery; if (categoryError) throw categoryError;
+      const categoryIds = (categories ?? []).map((c:any)=>c.id);
+      let itemQuery = supabase.from("menu_items").select("id,category_id,name,description,price,dietary_tags,is_available,item_type").in("category_id",categoryIds.length?categoryIds:["00000000-0000-0000-0000-000000000000"]).order("display_order").limit(30);
+      if (input.item) itemQuery=itemQuery.ilike("name",`%${input.item}%`); else if (input.search) itemQuery=itemQuery.or(`name.ilike.%${input.search}%,description.ilike.%${input.search}%`);
+      const { data: items, error: itemError } = await itemQuery; if(itemError) throw itemError;
+      const itemIds=(items??[]).map((i:any)=>i.id);
+      const [{data:sizes},{data:links},{data:groups}]=await Promise.all([
+        supabase.from("menu_item_sizes").select("id,menu_item_id,name,price,is_available").in("menu_item_id",itemIds.length?itemIds:["00000000-0000-0000-0000-000000000000"]).order("display_order"),
+        supabase.from("menu_item_modifier_groups").select("menu_item_id,modifier_group_id,min_selections,max_selections,required,free_selections").in("menu_item_id",itemIds.length?itemIds:["00000000-0000-0000-0000-000000000000"]),
+        supabase.from("modifier_groups").select("id,name,description,selection_type,min_selections,max_selections").eq("restaurant_id",restaurantId).eq("is_active",true).order("display_order")]);
+      const groupIds=(links??[]).map((l:any)=>l.modifier_group_id);
+      let modifierQuery=supabase.from("modifiers").select("id,modifier_group_id,name,description,price_delta,max_quantity,is_available,action").in("modifier_group_id",groupIds.length?groupIds:["00000000-0000-0000-0000-000000000000"]).order("display_order");
+      if(input.modifier_group) modifierQuery=modifierQuery.ilike("name",`%${input.modifier_group}%`);
+      const {data:modifiers,error:modifierError}=await modifierQuery; if(modifierError) throw modifierError;
+      const categoryMap=new Map((categories??[]).map((c:any)=>[c.id,c.name]));
+      return response({restaurant:{id:info.restaurant.id,name:info.restaurant.name},categories:(categories??[]).map((c:any)=>({id:c.id,name:c.name})),items:(items??[]).map((item:any)=>({id:item.id,category:categoryMap.get(item.category_id),name:item.name,description:item.description,base_price:item.price,dietary_tags:item.dietary_tags,available:item.is_available,item_type:item.item_type,sizes:(sizes??[]).filter((s:any)=>s.menu_item_id===item.id),modifier_groups:(links??[]).filter((l:any)=>l.menu_item_id===item.id).map((l:any)=>({...l,group:(groups??[]).find((g:any)=>g.id===l.modifier_group_id)??null,modifiers:(modifiers??[]).filter((m:any)=>m.modifier_group_id===l.modifier_group_id)}))}))});
     }
-
     if (op === "menu/availability") {
-      const input = z.object({ menu_item_id: z.string().uuid(), size_id: z.string().uuid().optional(), modifier_ids: z.array(z.string().uuid()).optional(), scheduled_for: z.string().datetime().optional() }).parse(args);
-      const info = await restaurantInfo(supabase, restaurantId, locationId);
-      const local = localParts(input.scheduled_for, info.restaurant.timezone);
-      const { data: item } = await supabase.from("menu_items").select("id,name,is_available").eq("id", input.menu_item_id).single();
-      if (!item) return fail("ITEM_NOT_FOUND", "That menu item could not be found.", 404);
-      if (!item.is_available) return response({ available: false, reason: "item_unavailable" });
-      if (local) {
-        const { data: windows } = await supabase.from("menu_item_availability_windows").select("starts_at,ends_at").eq("menu_item_id", item.id).eq("day_of_week", local.weekday);
-        if ((windows ?? []).length && !(windows ?? []).some((w: any) => local.time >= w.starts_at.slice(0,5) && local.time < w.ends_at.slice(0,5))) return response({ available: false, reason: "outside_item_availability_window" });
-      }
-      if (input.size_id) { const { data: size } = await supabase.from("menu_item_sizes").select("id,name,is_available").eq("id", input.size_id).eq("menu_item_id", item.id).maybeSingle(); if (!size) return fail("INVALID_SIZE", "That size is not available for this item."); if (!size.is_available) return response({ available: false, reason: "size_unavailable", size }); }
-      if (input.modifier_ids?.length) {
-        const { data: modifiers } = await supabase.from("modifiers").select("id,name,is_available,modifier_group_id").in("id", input.modifier_ids);
-        if ((modifiers ?? []).length !== input.modifier_ids.length) return fail("MODIFIER_NOT_FOUND", "One or more modifiers could not be found.");
-        if ((modifiers ?? []).some((m: any) => !m.is_available)) return response({ available: false, reason: "modifier_unavailable", modifiers });
-        const { data: links } = await supabase.from("menu_item_modifier_groups").select("modifier_group_id").eq("menu_item_id", item.id);
-        const allowed = new Set((links ?? []).map((l: any) => l.modifier_group_id));
-        if ((modifiers ?? []).some((m: any) => !allowed.has(m.modifier_group_id))) return response({ available: false, reason: "modifier_not_applicable" });
-      }
-      return response({ available: true, item });
+      const input=z.object({menu_item_id:z.string().uuid(),size_id:z.string().uuid().optional(),modifier_ids:z.array(z.string().uuid()).optional(),scheduled_for:z.string().datetime().optional()}).parse(args);
+      const info=await restaurantInfo(supabase,restaurantId,locationId); const local=localParts(input.scheduled_for,info.restaurant.timezone);
+      const {data:item}=await supabase.from("menu_items").select("id,name,is_available").eq("id",input.menu_item_id).single(); if(!item)return fail("ITEM_NOT_FOUND","That menu item could not be found.",404); if(!item.is_available)return response({available:false,reason:"item_unavailable"});
+      if(local){const {data:windows}=await supabase.from("menu_item_availability_windows").select("starts_at,ends_at").eq("menu_item_id",item.id).eq("day_of_week",local.weekday); if((windows??[]).length&&!(windows??[]).some((w:any)=>local.time>=w.starts_at.slice(0,5)&&local.time<w.ends_at.slice(0,5)))return response({available:false,reason:"outside_item_availability_window"});}
+      if(input.size_id){const {data:size}=await supabase.from("menu_item_sizes").select("id,name,is_available").eq("id",input.size_id).eq("menu_item_id",item.id).maybeSingle();if(!size)return fail("INVALID_SIZE","That size is not available for this item.");if(!size.is_available)return response({available:false,reason:"size_unavailable",size});}
+      if(input.modifier_ids?.length){const {data:modifiers}=await supabase.from("modifiers").select("id,name,is_available,modifier_group_id").in("id",input.modifier_ids);if((modifiers??[]).length!==input.modifier_ids.length)return fail("MODIFIER_NOT_FOUND","One or more modifiers could not be found.");if((modifiers??[]).some((m:any)=>!m.is_available))return response({available:false,reason:"modifier_unavailable",modifiers});const {data:links}=await supabase.from("menu_item_modifier_groups").select("modifier_group_id").eq("menu_item_id",item.id);const allowed=new Set((links??[]).map((l:any)=>l.modifier_group_id));if((modifiers??[]).some((m:any)=>!allowed.has(m.modifier_group_id)))return response({available:false,reason:"modifier_not_applicable"});}
+      return response({available:true,item});
     }
-
-    if (op === "order/quote") {
-      const input = z.object({ customer_name:z.string().trim().min(1).max(120), customer_phone:z.string().trim().min(7).max(30), customer_email:z.string().email().max(320).optional(), fulfillment_type:z.enum(["pickup","delivery","dine_in"]), notes:z.string().max(1000).optional(), scheduled_for:z.string().datetime().optional(), delivery_address_line1:z.string().max(200).optional(), delivery_address_line2:z.string().max(200).optional(), delivery_city:z.string().max(100).optional(), delivery_province:z.string().max(100).optional(), delivery_postal_code:z.string().max(30).optional(), delivery_instructions:z.string().max(1000).optional(), table_number:z.string().max(30).optional(), items:itemsSchema }).parse(args);
-      const phone = await resolveCustomerPhone(supabase, restaurantId, input.customer_phone);
-      const { data, error } = await supabase.rpc("quote_complex_order_atomic", { p_restaurant_id:restaurantId,p_location_id:locationId,p_customer_name:input.customer_name,p_customer_phone:phone,p_fulfillment_type:input.fulfillment_type,p_notes:input.notes??null,p_scheduled_for:input.scheduled_for??null,p_delivery_address_line1:input.delivery_address_line1??null,p_delivery_address_line2:input.delivery_address_line2??null,p_delivery_city:input.delivery_city??null,p_delivery_province:input.delivery_province??null,p_delivery_postal_code:input.delivery_postal_code??null,p_delivery_instructions:input.delivery_instructions??null,p_table_number:input.table_number??null,p_items:input.items });
-      if (error) throw error;
-      return response({ quote:data });
-    }
-
-    if (op === "order/create") {
-      const input = z.object({ customer_name:z.string().trim().min(1).max(120),customer_phone:z.string().trim().min(7).max(30),customer_email:z.string().email().max(320).optional(),fulfillment_type:z.enum(["pickup","delivery","dine_in"]),notes:z.string().max(1000).optional(),scheduled_for:z.string().datetime().optional(),delivery_address_line1:z.string().max(200).optional(),delivery_address_line2:z.string().max(200).optional(),delivery_city:z.string().max(100).optional(),delivery_province:z.string().max(100).optional(),delivery_postal_code:z.string().max(30).optional(),delivery_instructions:z.string().max(1000).optional(),table_number:z.string().max(30).optional(),items:itemsSchema,idempotency_key:z.string().trim().min(8).max(200).optional() }).parse(args);
-      const phone = await resolveCustomerPhone(supabase, restaurantId, input.customer_phone);
-      const requestHash = hash({ ...input, customer_phone:phone, idempotency_key:undefined });
-      const callId = payload?.call?.call_id;
-      const idempotencyKey = input.idempotency_key ?? (callId ? hash(`${callId}:order.create:${requestHash}`).slice(0,48) : null);
-      if (!idempotencyKey) return fail("IDEMPOTENCY_KEY_REQUIRED", "A unique order request identifier is required before creating an order.", 400, false);
-      const { data, error } = await supabase.rpc("create_ai_order_idempotent", { p_agent_id:agentId,p_restaurant_id:restaurantId,p_location_id:locationId,p_idempotency_key:idempotencyKey,p_request_hash:requestHash,p_customer_name:input.customer_name,p_customer_phone:phone,p_fulfillment_type:input.fulfillment_type,p_notes:input.notes??null,p_scheduled_for:input.scheduled_for??null,p_delivery_address_line1:input.delivery_address_line1??null,p_delivery_address_line2:input.delivery_address_line2??null,p_delivery_city:input.delivery_city??null,p_delivery_province:input.delivery_province??null,p_delivery_postal_code:input.delivery_postal_code??null,p_delivery_instructions:input.delivery_instructions??null,p_table_number:input.table_number??null,p_items:input.items });
-      if (error) throw error;
-      const order = data as any;
-      if (input.customer_email && order?.id) { await supabase.from("customers").update({ email:input.customer_email, first_name:input.customer_name.split(/\s+/)[0] ?? null, last_name:input.customer_name.split(/\s+/).slice(1).join(" ") || null, updated_at:new Date().toISOString() }).eq("restaurant_id",restaurantId).eq("phone_normalized",normalizePhone(phone)); await supabase.from("orders").update({ customer_email:input.customer_email }).eq("id",order.id).eq("restaurant_id",restaurantId); }
-      return response({ order }, 201);
-    }
-
-    if (op === "order/lookup") {
-      const input = z.object({ order_number:z.coerce.number().int().positive(), customer_phone:z.string().min(7).max(30) }).parse(args);
-      const order = await loadOrder(supabase,restaurantId,locationId,input.order_number,input.customer_phone);
-      if (!order) return fail("ORDER_NOT_FOUND", "I could not find an order matching that order number and phone number.",404);
-      return response({ order });
-    }
-
-    if (op === "order/modify") {
-      const input = z.object({ order_number:z.coerce.number().int().positive(),customer_phone:z.string().min(7).max(30),customer_name:z.string().trim().min(1).max(120).optional(),customer_email:z.string().email().max(320).optional(),fulfillment_type:z.enum(["pickup","delivery","dine_in"]).optional(),notes:z.string().max(1000).optional(),scheduled_for:z.string().datetime().optional(),delivery_address_line1:z.string().max(200).optional(),delivery_address_line2:z.string().max(200).optional(),delivery_city:z.string().max(100).optional(),delivery_province:z.string().max(100).optional(),delivery_postal_code:z.string().max(30).optional(),delivery_instructions:z.string().max(1000).optional(),table_number:z.string().max(30).optional(),items:itemsSchema }).parse(args);
-      const order = await loadOrder(supabase,restaurantId,locationId,input.order_number,input.customer_phone);
-      if (!order) return fail("ORDER_NOT_FOUND","I could not find an order matching that order number and phone number.",404);
-      const phone = await resolveCustomerPhone(supabase,restaurantId,input.customer_phone);
-      const { data, error } = await supabase.rpc("modify_ai_order_atomic", { p_agent_id:agentId,p_restaurant_id:restaurantId,p_location_id:locationId,p_order_id:order.id,p_customer_phone:phone,p_customer_name:input.customer_name??order.customer_name,p_customer_email:input.customer_email??order.customer_email,p_fulfillment_type:input.fulfillment_type??order.fulfillment_type,p_notes:input.notes??order.notes,p_scheduled_for:input.scheduled_for??order.scheduled_for,p_delivery_address_line1:input.delivery_address_line1??order.delivery_address_line1,p_delivery_address_line2:input.delivery_address_line2??order.delivery_address_line2,p_delivery_city:input.delivery_city??order.delivery_city,p_delivery_province:input.delivery_province??order.delivery_province,p_delivery_postal_code:input.delivery_postal_code??order.delivery_postal_code,p_delivery_instructions:input.delivery_instructions??order.delivery_instructions,p_table_number:input.table_number??order.table_number,p_items:input.items });
-      if (error) throw error;
-      return response({ order:data });
-    }
-
-    if (op === "order/cancel") {
-      const input = z.object({ order_number:z.coerce.number().int().positive(),customer_phone:z.string().min(7).max(30),reason:z.string().max(500).optional() }).parse(args);
-      const order = await loadOrder(supabase,restaurantId,locationId,input.order_number,input.customer_phone);
-      if (!order) return fail("ORDER_NOT_FOUND","I could not find an order matching that order number and phone number.",404);
-      if (!["pending","confirmed","preparing","ready"].includes(order.status)) return fail("ORDER_NOT_CANCELLABLE","This order can no longer be cancelled.",409);
-      const { data, error } = await supabase.from("orders").update({ status:"cancelled",notes:input.reason ? `${order.notes ? `${order.notes}\n` : ""}Cancellation requested by customer: ${input.reason}` : order.notes,updated_at:new Date().toISOString() }).eq("id",order.id).eq("restaurant_id",restaurantId).eq("location_id",locationId).select("*").single();
-      if (error) throw error;
-      return response({ order:data });
-    }
-
-    if (op === "reservation/check") {
-      const input = z.object({ party_size:z.coerce.number().int().min(1).max(50),requested_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),requested_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/) }).parse(args);
-      const info = await restaurantInfo(supabase,restaurantId,locationId);
-      if (!info.settings?.reservations_enabled) return response({ available:false,reason:"reservations_disabled" });
-      if (input.party_size > Number(info.restaurant.max_online_party_size ?? 0)) return response({ available:false,reason:"party_size_limit",max_party_size:info.restaurant.max_online_party_size });
-      const day = new Date(`${input.requested_date}T12:00:00Z`).getUTCDay();
-      const hour = input.requested_time.slice(0,5);
-      const hours = (info.hours ?? []).filter((h:any)=>h.day_of_week===day);
-      if (!hours.length || hours.every((h:any)=>h.is_closed || !h.opens_at || !h.closes_at || !(hour >= h.opens_at.slice(0,5) && hour < h.closes_at.slice(0,5)))) return response({ available:false,reason:"outside_restaurant_hours" });
-      const { data: existing } = await supabase.from("reservations").select("party_size,status,requested_time").eq("restaurant_id",restaurantId).eq("location_id",locationId).eq("requested_date",input.requested_date).in("status",["pending","confirmed","alternative_proposed"]);
-      const capacity = info.settings.reservation_capacity == null ? null : Number(info.settings.reservation_capacity);
-      const used = (existing ?? []).filter((r:any)=>r.requested_time?.slice(0,5)===hour).reduce((sum:number,r:any)=>sum+Number(r.party_size),0);
-      const capacityAvailable = capacity == null ? null : used + input.party_size <= capacity;
-      return response({ available:capacityAvailable === null ? true : capacityAvailable, capacity_configured:capacity !== null, capacity_remaining:capacity === null ? null : Math.max(capacity-used,0), requires_manual_confirmation:!info.settings.reservations_auto_confirm || input.party_size > Number(info.settings.reservations_max_auto_party_size ?? 0), requested_date:input.requested_date,requested_time:input.requested_time });
-    }
-
-    if (op === "reservation/create") {
-      const input = z.object({ customer_name:z.string().trim().min(1).max(120),customer_phone:z.string().min(7).max(30),customer_email:z.string().email().max(320).optional(),party_size:z.coerce.number().int().min(1).max(50),requested_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),requested_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),seating_preference:z.enum(["indoor","patio","booth","no_preference"]).optional(),customer_notes:z.string().max(1000).optional(),special_request:z.string().max(1000).optional() }).parse(args);
-      const phone = await resolveCustomerPhone(supabase,restaurantId,input.customer_phone);
-      const info = await restaurantInfo(supabase,restaurantId,locationId);
-      if (!info.settings?.reservations_enabled) return fail("RESERVATIONS_DISABLED","Reservations are currently unavailable.",409);
-      if (input.party_size > Number(info.restaurant.max_online_party_size ?? 0)) return fail("PARTY_SIZE_LIMIT","That party size is above the restaurant's online reservation limit.");
-      const { data, error } = await supabase.rpc("create_reservation_atomic",{p_restaurant_id:restaurantId,p_location_id:locationId,p_customer_name:input.customer_name,p_customer_phone:phone,p_party_size:input.party_size,p_requested_date:input.requested_date,p_requested_time:input.requested_time,p_customer_notes:[input.customer_notes,input.special_request].filter(Boolean).join(" | ")||null,p_source:"ai_phone"});
-      if (error) throw error;
-      const reservationId = (data as any)?.id;
-      if (reservationId) { await supabase.from("reservations").update({ seating_preference:input.seating_preference??null,customer_email:input.customer_email??null }).eq("id",reservationId).eq("restaurant_id",restaurantId); if (input.customer_email) await supabase.from("customers").update({email:input.customer_email,updated_at:new Date().toISOString()}).eq("restaurant_id",restaurantId).eq("phone_normalized",normalizePhone(phone)); }
-      let reservation = data;
-      if (reservationId && info.settings.reservations_auto_confirm && input.party_size <= Number(info.settings.reservations_max_auto_party_size ?? 0)) { const confirmed = await supabase.rpc("update_reservation_status",{p_reservation_id:reservationId,p_status:"confirmed",p_actor_type:"ai",p_note:null}); if (!confirmed.error) reservation=confirmed.data; }
-      return response({ reservation },201);
-    }
-
-    if (op === "reservation/lookup") {
-      const input = z.object({ reservation_number:z.coerce.number().int().positive(),customer_phone:z.string().min(7).max(30) }).parse(args);
-      const reservation = await loadReservation(supabase,restaurantId,locationId,input.reservation_number,input.customer_phone);
-      if (!reservation) return fail("RESERVATION_NOT_FOUND","I could not find a reservation matching that reservation number and phone number.",404);
-      return response({ reservation });
-    }
-
-    if (op === "reservation/update") {
-      const input = z.object({ reservation_number:z.coerce.number().int().positive(),customer_phone:z.string().min(7).max(30),operation:z.enum(["confirm","decline","cancel","propose_time"]),proposed_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),proposed_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/).optional(),note:z.string().max(1000).optional() }).parse(args);
-      const reservation = await loadReservation(supabase,restaurantId,locationId,input.reservation_number,input.customer_phone);
-      if (!reservation) return fail("RESERVATION_NOT_FOUND","I could not find a reservation matching that reservation number and phone number.",404);
-      const info = await restaurantInfo(supabase,restaurantId,locationId);
-      if (input.operation === "cancel") { const { data,error }=await supabase.rpc("update_reservation_status",{p_reservation_id:reservation.id,p_status:"cancelled",p_actor_type:"ai",p_note:input.note??null}); if(error) throw error; return response({reservation:data}); }
-      if (!info.settings.reservations_auto_confirm) return fail("STAFF_APPROVAL_REQUIRED","This restaurant requires staff approval for reservation changes.",409);
-      if (input.operation === "confirm") { if (reservation.party_size > Number(info.settings.reservations_max_auto_party_size ?? 0)) return fail("STAFF_APPROVAL_REQUIRED","This party size requires staff confirmation.",409); const {data,error}=await supabase.rpc("update_reservation_status",{p_reservation_id:reservation.id,p_status:"confirmed",p_actor_type:"ai",p_note:input.note??null}); if(error) throw error; return response({reservation:data}); }
-      if (input.operation === "decline") { const {data,error}=await supabase.rpc("update_reservation_status",{p_reservation_id:reservation.id,p_status:"declined",p_actor_type:"ai",p_note:input.note??null}); if(error) throw error; return response({reservation:data}); }
-      if (!input.proposed_date || !input.proposed_time) return fail("PROPOSED_TIME_REQUIRED","A proposed date and time are required.");
-      const {data,error}=await supabase.rpc("propose_reservation_time",{p_reservation_id:reservation.id,p_proposed_date:input.proposed_date,p_proposed_time:input.proposed_time,p_note:input.note??null}); if(error) throw error; return response({reservation:data});
-    }
-
-    return fail("UNKNOWN_OPERATION", "That AI operation is not available.", 404, false);
-  } catch (error) {
-    console.error(`AI ${op}`, error);
-    const message = userError(error);
-    const status = message.includes("not found") ? 404 : message.includes("requires") || message.includes("cannot") ? 409 : 400;
-    return fail("REQUEST_REJECTED", message, status, true);
-  }
+    if(op==="order/quote"){const input=z.object({customer_name:z.string().trim().min(1).max(120),customer_phone:z.string().trim().min(7).max(30),customer_email:z.string().email().max(320).optional(),fulfillment_type:z.enum(["pickup","delivery","dine_in"]),notes:z.string().max(1000).optional(),scheduled_for:z.string().datetime().optional(),delivery_address_line1:z.string().max(200).optional(),delivery_address_line2:z.string().max(200).optional(),delivery_city:z.string().max(100).optional(),delivery_province:z.string().max(100).optional(),delivery_postal_code:z.string().max(30).optional(),delivery_instructions:z.string().max(1000).optional(),table_number:z.string().max(30).optional(),items:itemsSchema}).parse(args);const phone=await resolveCustomerPhone(supabase,restaurantId,input.customer_phone);const {data,error}=await supabase.rpc("quote_complex_order_atomic",{p_restaurant_id:restaurantId,p_location_id:locationId,p_customer_name:input.customer_name,p_customer_phone:phone,p_fulfillment_type:input.fulfillment_type,p_notes:input.notes??null,p_scheduled_for:input.scheduled_for??null,p_delivery_address_line1:input.delivery_address_line1??null,p_delivery_address_line2:input.delivery_address_line2??null,p_delivery_city:input.delivery_city??null,p_delivery_province:input.delivery_province??null,p_delivery_postal_code:input.delivery_postal_code??null,p_delivery_instructions:input.delivery_instructions??null,p_table_number:input.table_number??null,p_items:input.items});if(error)throw error;return response({quote:data});}
+    if(op==="order/create"){const input=z.object({customer_name:z.string().trim().min(1).max(120),customer_phone:z.string().trim().min(7).max(30),customer_email:z.string().email().max(320).optional(),fulfillment_type:z.enum(["pickup","delivery","dine_in"]),notes:z.string().max(1000).optional(),scheduled_for:z.string().datetime().optional(),delivery_address_line1:z.string().max(200).optional(),delivery_address_line2:z.string().max(200).optional(),delivery_city:z.string().max(100).optional(),delivery_province:z.string().max(100).optional(),delivery_postal_code:z.string().max(30).optional(),delivery_instructions:z.string().max(1000).optional(),table_number:z.string().max(30).optional(),items:itemsSchema,idempotency_key:z.string().trim().min(8).max(200).optional()}).parse(args);const phone=await resolveCustomerPhone(supabase,restaurantId,input.customer_phone);const requestHash=hash({...input,customer_phone:phone,idempotency_key:undefined});const callId=payload?.call?.call_id;const idempotencyKey=input.idempotency_key??(callId?hash(`${callId}:order.create:${requestHash}`).slice(0,48):null);if(!idempotencyKey)return fail("IDEMPOTENCY_KEY_REQUIRED","A unique order request identifier is required before creating an order.",400,false);const {data,error}=await supabase.rpc("create_ai_order_idempotent",{p_agent_id:agentId,p_restaurant_id:restaurantId,p_location_id:locationId,p_idempotency_key:idempotencyKey,p_request_hash:requestHash,p_customer_name:input.customer_name,p_customer_phone:phone,p_fulfillment_type:input.fulfillment_type,p_notes:input.notes??null,p_scheduled_for:input.scheduled_for??null,p_delivery_address_line1:input.delivery_address_line1??null,p_delivery_address_line2:input.delivery_address_line2??null,p_delivery_city:input.delivery_city??null,p_delivery_province:input.delivery_province??null,p_delivery_postal_code:input.delivery_postal_code??null,p_delivery_instructions:input.delivery_instructions??null,p_table_number:input.table_number??null,p_items:input.items});if(error)throw error;const order=data as any;if(input.customer_email&&order?.id){await supabase.from("customers").update({email:input.customer_email,first_name:input.customer_name.split(/\s+/)[0]??null,last_name:input.customer_name.split(/\s+/).slice(1).join(" ")||null,updated_at:new Date().toISOString()}).eq("restaurant_id",restaurantId).eq("phone_normalized",normalizePhone(phone));await supabase.from("orders").update({customer_email:input.customer_email}).eq("id",order.id).eq("restaurant_id",restaurantId);}return response({order},201);}
+    if(op==="order/lookup"){const input=z.object({order_number:z.coerce.number().int().positive(),customer_phone:z.string().min(7).max(30)}).parse(args);const order=await loadOrder(supabase,restaurantId,locationId,input.order_number,input.customer_phone);if(!order)return fail("ORDER_NOT_FOUND","I could not find an order matching that order number and phone number.",404);return response({order});}
+    if(op==="order/modify"){const input=z.object({order_number:z.coerce.number().int().positive(),customer_phone:z.string().min(7).max(30),customer_name:z.string().trim().min(1).max(120).optional(),customer_email:z.string().email().max(320).optional(),fulfillment_type:z.enum(["pickup","delivery","dine_in"]).optional(),notes:z.string().max(1000).optional(),scheduled_for:z.string().datetime().optional(),delivery_address_line1:z.string().max(200).optional(),delivery_address_line2:z.string().max(200).optional(),delivery_city:z.string().max(100).optional(),delivery_province:z.string().max(100).optional(),delivery_postal_code:z.string().max(30).optional(),delivery_instructions:z.string().max(1000).optional(),table_number:z.string().max(30).optional(),items:itemsSchema}).parse(args);const order=await loadOrder(supabase,restaurantId,locationId,input.order_number,input.customer_phone);if(!order)return fail("ORDER_NOT_FOUND","I could not find an order matching that order number and phone number.",404);const phone=await resolveCustomerPhone(supabase,restaurantId,input.customer_phone);const {data,error}=await supabase.rpc("modify_ai_order_atomic",{p_agent_id:agentId,p_restaurant_id:restaurantId,p_location_id:locationId,p_order_id:order.id,p_customer_phone:phone,p_customer_name:input.customer_name??order.customer_name,p_customer_email:input.customer_email??order.customer_email,p_fulfillment_type:input.fulfillment_type??order.fulfillment_type,p_notes:input.notes??order.notes,p_scheduled_for:input.scheduled_for??order.scheduled_for,p_delivery_address_line1:input.delivery_address_line1??order.delivery_address_line1,p_delivery_address_line2:input.delivery_address_line2??order.delivery_address_line2,p_delivery_city:input.delivery_city??order.delivery_city,p_delivery_province:input.delivery_province??order.delivery_province,p_delivery_postal_code:input.delivery_postal_code??order.delivery_postal_code,p_delivery_instructions:input.delivery_instructions??order.delivery_instructions,p_table_number:input.table_number??order.table_number,p_items:input.items});if(error)throw error;return response({order:data});}
+    if(op==="order/cancel"){const input=z.object({order_number:z.coerce.number().int().positive(),customer_phone:z.string().min(7).max(30),reason:z.string().max(500).optional()}).parse(args);const order=await loadOrder(supabase,restaurantId,locationId,input.order_number,input.customer_phone);if(!order)return fail("ORDER_NOT_FOUND","I could not find an order matching that order number and phone number.",404);const {data,error}=await supabase.rpc("cancel_ai_order",{p_agent_id:agentId,p_restaurant_id:restaurantId,p_location_id:locationId,p_order_id:order.id,p_customer_phone:input.customer_phone,p_reason:input.reason??null});if(error)throw error;return response({order:data});}
+    if(op==="reservation/check"){const input=z.object({party_size:z.coerce.number().int().min(1).max(50),requested_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),requested_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/)}).parse(args);return response(await reservationAvailability(supabase,restaurantId,locationId,input));}
+    if(op==="reservation/create"){const input=z.object({customer_name:z.string().trim().min(1).max(120),customer_phone:z.string().min(7).max(30),customer_email:z.string().email().max(320).optional(),party_size:z.coerce.number().int().min(1).max(50),requested_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),requested_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),seating_preference:z.enum(["indoor","patio","booth","no_preference"]).optional(),customer_notes:z.string().max(1000).optional(),special_request:z.string().max(1000).optional()}).parse(args);const phone=await resolveCustomerPhone(supabase,restaurantId,input.customer_phone);const info=await restaurantInfo(supabase,restaurantId,locationId);if(!info.settings?.reservations_enabled)return fail("RESERVATIONS_DISABLED","Reservations are currently unavailable.",409);const availability=await reservationAvailability(supabase,restaurantId,locationId,{party_size:input.party_size,requested_date:input.requested_date,requested_time:input.requested_time},info);if(!availability.available)return fail("RESERVATION_UNAVAILABLE",availability.reason==="outside_restaurant_hours"?"The requested reservation time is outside restaurant hours.":availability.reason==="party_size_limit"?"That party size is above the restaurant's online reservation limit.":"That reservation time is not available.",409);const {data,error}=await supabase.rpc("create_reservation_atomic",{p_restaurant_id:restaurantId,p_location_id:locationId,p_customer_name:input.customer_name,p_customer_phone:phone,p_party_size:input.party_size,p_requested_date:input.requested_date,p_requested_time:input.requested_time,p_customer_notes:[input.customer_notes,input.special_request].filter(Boolean).join(" | ")||null,p_source:"ai_phone"});if(error)throw error;const reservationId=(data as any)?.id;if(reservationId){await supabase.from("reservations").update({seating_preference:input.seating_preference??null,customer_email:input.customer_email??null}).eq("id",reservationId).eq("restaurant_id",restaurantId);if(input.customer_email)await supabase.from("customers").update({email:input.customer_email,updated_at:new Date().toISOString()}).eq("restaurant_id",restaurantId).eq("phone_normalized",normalizePhone(phone));}let reservation=data;if(reservationId&&info.settings.reservations_auto_confirm&&input.party_size<=Number(info.settings.reservations_max_auto_party_size??0)){const confirmed=await supabase.rpc("update_reservation_status",{p_reservation_id:reservationId,p_status:"confirmed",p_actor_type:"ai",p_note:null});if(!confirmed.error)reservation=confirmed.data;}return response({reservation},201);}
+    if(op==="reservation/lookup"){const input=z.object({reservation_number:z.coerce.number().int().positive(),customer_phone:z.string().min(7).max(30)}).parse(args);const reservation=await loadReservation(supabase,restaurantId,locationId,input.reservation_number,input.customer_phone);if(!reservation)return fail("RESERVATION_NOT_FOUND","I could not find a reservation matching that reservation number and phone number.",404);return response({reservation});}
+    if(op==="reservation/update"){const input=z.object({reservation_number:z.coerce.number().int().positive(),customer_phone:z.string().min(7).max(30),operation:z.enum(["confirm","decline","cancel","propose_time"]),proposed_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),proposed_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/).optional(),note:z.string().max(1000).optional()}).parse(args);const reservation=await loadReservation(supabase,restaurantId,locationId,input.reservation_number,input.customer_phone);if(!reservation)return fail("RESERVATION_NOT_FOUND","I could not find a reservation matching that reservation number and phone number.",404);const info=await restaurantInfo(supabase,restaurantId,locationId);if(input.operation==="cancel"){const {data,error}=await supabase.rpc("update_reservation_status",{p_reservation_id:reservation.id,p_status:"cancelled",p_actor_type:"ai",p_note:input.note??null});if(error)throw error;return response({reservation:data});}if(!info.settings.reservations_auto_confirm)return fail("STAFF_APPROVAL_REQUIRED","This restaurant requires staff approval for reservation changes.",409);if(input.operation==="confirm"){if(reservation.party_size>Number(info.settings.reservations_max_auto_party_size??0))return fail("STAFF_APPROVAL_REQUIRED","This party size requires staff confirmation.",409);const {data,error}=await supabase.rpc("update_reservation_status",{p_reservation_id:reservation.id,p_status:"confirmed",p_actor_type:"ai",p_note:input.note??null});if(error)throw error;return response({reservation:data});}if(input.operation==="decline"){const {data,error}=await supabase.rpc("update_reservation_status",{p_reservation_id:reservation.id,p_status:"declined",p_actor_type:"ai",p_note:input.note??null});if(error)throw error;return response({reservation:data});}if(!input.proposed_date||!input.proposed_time)return fail("PROPOSED_TIME_REQUIRED","A proposed date and time are required.");const {data,error}=await supabase.rpc("propose_reservation_time",{p_reservation_id:reservation.id,p_proposed_date:input.proposed_date,p_proposed_time:input.proposed_time,p_note:input.note??null});if(error)throw error;return response({reservation:data});}
+    return fail("UNKNOWN_OPERATION","That AI operation is not available.",404,false);
+  } catch(error) { console.error(`AI ${op}`,error); const message=userError(error); const status=message.includes("not found")?404:message.includes("requires")||message.includes("cannot")||message.includes("can no longer")?409:400; return fail("REQUEST_REJECTED",message,status,true); }
 }
