@@ -24,6 +24,7 @@ const itemSchema = z.object({
 const createOrderSchema = z.object({
   customer_name: z.string().trim().min(1).max(120),
   customer_phone: z.string().trim().min(7).max(30),
+  customer_email: z.string().trim().email().max(320).optional(),
   fulfillment_type: z.enum(["pickup", "delivery", "dine_in"]),
   notes: z.string().max(1000).optional(),
   scheduled_for: z.string().datetime().optional(),
@@ -78,6 +79,24 @@ export async function POST(request: Request) {
     const parsed = createOrderSchema.safeParse(await request.json());
     if (!parsed.success) return NextResponse.json({ error: "Invalid order payload.", details: parsed.error.flatten() }, { status: 400 });
     const { supabase, restaurantId, locationId } = await restaurantScope();
+
+    if (parsed.data.customer_email) {
+      const { error: customerError } = await supabase.from("customers").upsert({
+        restaurant_id: restaurantId,
+        name: parsed.data.customer_name,
+        phone: parsed.data.customer_phone,
+        email: parsed.data.customer_email,
+        default_address_line1: parsed.data.delivery_address_line1 ?? null,
+        default_address_line2: parsed.data.delivery_address_line2 ?? null,
+        default_city: parsed.data.delivery_city ?? null,
+        default_province: parsed.data.delivery_province ?? null,
+        default_postal_code: parsed.data.delivery_postal_code ?? null,
+        delivery_instructions: parsed.data.delivery_instructions ?? null,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "restaurant_id,phone" });
+      if (customerError) throw customerError;
+    }
+
     const { data, error } = await supabase.rpc("create_complex_order_atomic", {
       p_restaurant_id: restaurantId,
       p_location_id: locationId,
@@ -96,6 +115,13 @@ export async function POST(request: Request) {
       p_items: parsed.data.items,
     });
     if (error) throw error;
+
+    const createdOrderId = data && typeof data === "object" && "id" in data ? String((data as { id: string }).id) : null;
+    if (createdOrderId && parsed.data.customer_email) {
+      const { error: orderEmailError } = await supabase.from("orders").update({ customer_email: parsed.data.customer_email }).eq("id", createdOrderId).eq("restaurant_id", restaurantId);
+      if (orderEmailError) throw orderEmailError;
+    }
+
     return NextResponse.json({ order: data }, { status: 201 });
   } catch (error) {
     console.error("POST /api/orders", error);
