@@ -1,5 +1,7 @@
 import { createServerSupabase } from "@/lib/supabase/server";
 
+export const dynamic = "force-dynamic";
+
 const cards = [
   ["New orders", "pending", "orders"], ["Preparing", "preparing", "orders"], ["Ready", "ready", "orders"], ["Completed", "completed", "orders"], ["Pending reservations", "pending", "reservations"], ["Confirmed reservations", "confirmed", "reservations"],
 ];
