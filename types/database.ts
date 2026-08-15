@@ -13,7 +13,12 @@ export type Database = {
       ai_agents: { Row: { id:string; restaurant_id:string; location_id:string|null; retell_agent_id:string|null; name:string; language:string; status:string; configuration:Record<string, unknown>; created_at:string; updated_at:string }; Insert: never; Update: never };
     };
     Views: Record<string, never>;
-    Functions: Record<string, never>;
+    Functions: {
+      create_order_atomic: { Args: { p_restaurant_id:string; p_location_id:string; p_customer_name:string; p_customer_phone:string; p_fulfillment_type:string; p_notes:string|null; p_items:unknown[] }; Returns: Record<string, unknown> };
+      create_reservation_atomic: { Args: { p_restaurant_id:string; p_location_id:string; p_customer_name:string; p_customer_phone:string; p_party_size:number; p_requested_date:string; p_requested_time:string; p_customer_notes:string|null; p_source:string }; Returns: Record<string, unknown> };
+      update_reservation_status: { Args: { p_reservation_id:string; p_status:string; p_actor_type:string; p_note:string|null }; Returns: Record<string, unknown> };
+      propose_reservation_time: { Args: { p_reservation_id:string; p_proposed_date:string; p_proposed_time:string; p_note:string|null }; Returns: Record<string, unknown> };
+    };
     Enums: Record<string, never>;
     CompositeTypes: Record<string, never>;
   };
