@@ -4,7 +4,6 @@ import { createServerSupabase } from "@/lib/supabase/server";
 
 const itemSchema = z.object({ menu_item_id: z.string().uuid(), quantity: z.number().int().min(1).max(99), special_instructions: z.string().max(500).optional() });
 const createOrderSchema = z.object({ customer_name: z.string().trim().min(1).max(120), customer_phone: z.string().trim().min(7).max(30), fulfillment_type: z.enum(["pickup", "delivery", "dine_in"]), notes: z.string().max(1000).optional(), items: z.array(itemSchema).min(1).max(50) });
-
 type RestaurantScope = { id: string };
 type LocationScope = { id: string };
 
@@ -22,9 +21,14 @@ const restaurantScope = async () => {
 export async function GET() {
   try {
     const { supabase, restaurantId, locationId } = await restaurantScope();
-    const { data, error } = await supabase.from("orders").select("*, order_items(*)").eq("restaurant_id", restaurantId).eq("location_id", locationId).order("created_at", { ascending: false });
+    const { data: rawOrders, error } = await supabase.from("orders").select("*").eq("restaurant_id", restaurantId).eq("location_id", locationId).order("created_at", { ascending: false });
     if (error) throw error;
-    return NextResponse.json({ orders: data ?? [] });
+    const orders = rawOrders ?? [];
+    const orderIds = orders.map((order) => order.id);
+    const { data: rawItems, error: itemError } = orderIds.length ? await supabase.from("order_items").select("*").in("order_id", orderIds) : { data: [], error: null };
+    if (itemError) throw itemError;
+    const items = rawItems ?? [];
+    return NextResponse.json({ orders: orders.map((order) => ({ ...order, order_items: items.filter((item) => item.order_id === order.id) })) });
   } catch (error) {
     console.error("GET /api/orders", error);
     return NextResponse.json({ error: "Unable to load orders." }, { status: 500 });
