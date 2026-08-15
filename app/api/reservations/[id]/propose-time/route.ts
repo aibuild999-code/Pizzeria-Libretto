@@ -1,0 +1,6 @@
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { createServerSupabase } from "@/lib/supabase/server";
+
+const schema=z.object({proposed_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),proposed_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),note:z.string().max(1000).optional()});
+export async function POST(request:Request,context:{params:Promise<{id:string}>}){try{const {id}=await context.params;if(!z.string().uuid().safeParse(id).success)return NextResponse.json({error:"Invalid reservation id."},{status:400});const parsed=schema.safeParse(await request.json());if(!parsed.success)return NextResponse.json({error:"Invalid proposed time."},{status:400});const supabase=createServerSupabase();const {data,error}=await supabase.rpc("propose_reservation_time",{p_reservation_id:id,p_proposed_date:parsed.data.proposed_date,p_proposed_time:parsed.data.proposed_time,p_note:parsed.data.note??null});if(error){if(error.message.includes("not found"))return NextResponse.json({error:"Reservation not found."},{status:404});throw error;}return NextResponse.json({reservation:data});}catch(error){console.error("POST /api/reservations/[id]/propose-time",error);return NextResponse.json({error:"Unable to propose reservation time."},{status:500});}}
