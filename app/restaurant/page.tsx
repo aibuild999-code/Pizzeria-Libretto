@@ -1,5 +1,7 @@
 import { createServerSupabase } from "@/lib/supabase/server";
 
+export const dynamic = "force-dynamic";
+
 export default async function RestaurantPage() {
   const supabase = createServerSupabase();
   const [{ data: restaurant }, { data: location }, { data: hours }] = await Promise.all([
