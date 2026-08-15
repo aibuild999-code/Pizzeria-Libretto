@@ -4,12 +4,18 @@ import { createServerSupabase } from "@/lib/supabase/server";
 
 const itemSchema = z.object({ menu_item_id: z.string().uuid(), quantity: z.number().int().min(1).max(99), special_instructions: z.string().max(500).optional() });
 const createOrderSchema = z.object({ customer_name: z.string().trim().min(1).max(120), customer_phone: z.string().trim().min(7).max(30), fulfillment_type: z.enum(["pickup", "delivery", "dine_in"]), notes: z.string().max(1000).optional(), items: z.array(itemSchema).min(1).max(50) });
+
+type RestaurantScope = { id: string };
+type LocationScope = { id: string };
+
 const restaurantScope = async () => {
   const supabase = createServerSupabase();
-  const { data: restaurant, error: re } = await supabase.from("restaurants").select("id").limit(1).single();
-  if (re || !restaurant) throw new Error("Restaurant not configured");
-  const { data: location, error: le } = await supabase.from("restaurant_locations").select("id").eq("restaurant_id", restaurant.id).eq("is_active", true).limit(1).single();
-  if (le || !location) throw new Error("Active restaurant location not configured");
+  const { data: rawRestaurant, error: re } = await supabase.from("restaurants").select("id").limit(1).single();
+  if (re || !rawRestaurant) throw new Error("Restaurant not configured");
+  const restaurant = rawRestaurant as RestaurantScope;
+  const { data: rawLocation, error: le } = await supabase.from("restaurant_locations").select("id").eq("restaurant_id", restaurant.id).eq("is_active", true).limit(1).single();
+  if (le || !rawLocation) throw new Error("Active restaurant location not configured");
+  const location = rawLocation as LocationScope;
   return { supabase, restaurantId: restaurant.id, locationId: location.id };
 };
 
