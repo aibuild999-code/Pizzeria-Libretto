@@ -42,9 +42,10 @@ async function isValidTwilioRequest(request: Request, params: URLSearchParams) {
   const signature = request.headers.get("X-Twilio-Signature");
   if (!authToken || !signature) return false;
 
-  const url = new URL(request.url);
+  // Twilio signs the exact webhook URL, including query parameters.
+  const url = new URL(request.url).toString();
   const sortedParams = [...params.entries()].sort(([a], [b]) => a.localeCompare(b));
-  const data = url.toString().split("?")[0] + sortedParams.map(([key, value]) => `${key}${value}`).join("");
+  const data = url + sortedParams.map(([key, value]) => `${key}${value}`).join("");
   const expected = createHmac("sha1", authToken).update(data).digest("base64");
   return timingSafeBase64Equal(expected, signature);
 }
