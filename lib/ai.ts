@@ -15,6 +15,7 @@ const itemsSchema = z.array(itemSchema).min(1).max(50);
 
 function response(data: unknown, status = 200) { return NextResponse.json({ success: true, data }, { status }); }
 function fail(error_code: string, message: string, status = 400, recoverable = true) { return NextResponse.json({ success: false, error_code, message, recoverable }, { status }); }
+function timing(operation: string, stage: string, startedAt: number) { console.info(`[AI_TIMING] operation=${operation} stage=${stage} elapsed_ms=${Math.round(performance.now() - startedAt)}`); }
 function normalizePhone(phone: string) { const digits = phone.replace(/\D/g, ""); if (digits.length === 10) return `1${digits}`; if (digits.length === 11 && digits.startsWith("1")) return digits; return ""; }
 function requirePhone(phone: string) { const normalized = normalizePhone(phone); if (!normalized) throw new Error("Invalid customer phone number"); return normalized; }
 function stable(value: any): string { if (value === null || typeof value !== "object") return JSON.stringify(value); if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`; return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${stable(value[k])}`).join(",")}}`; }
@@ -38,13 +39,18 @@ function getArgs(payload: JsonObject): JsonObject { return (payload.args && type
 function agentIdFrom(payload: JsonObject, args: JsonObject) { return payload?.call?.agent_id ?? payload.agent_id ?? args.agent_id ?? null; }
 
 async function authorize(request: Request): Promise<{ context?: AiContext; payload?: JsonObject; args?: JsonObject; error?: NextResponse }> {
+  const startedAt = performance.now();
   const rawBody = await request.text();
-  if (!verifyRetellSignature(rawBody, request.headers.get("X-Retell-Signature"))) return { error: fail("UNAUTHORIZED", "This request is not an authenticated Retell request.", 401, false) };
+  const signatureStartedAt = performance.now();
+  const signatureValid = verifyRetellSignature(rawBody, request.headers.get("X-Retell-Signature"));
+  timing("get_restaurant_info", "signature_verification", signatureStartedAt);
+  if (!signatureValid) return { error: fail("UNAUTHORIZED", "This request is not an authenticated Retell request.", 401, false) };
   let payload: JsonObject;
   try { payload = JSON.parse(rawBody); } catch { return { error: fail("INVALID_JSON", "The AI request body is not valid JSON.", 400, false) }; }
   const args = getArgs(payload);
   const agentId = agentIdFrom(payload, args);
   if (!agentId || typeof agentId !== "string") return { error: fail("AGENT_REQUIRED", "The authenticated AI request did not identify an agent.", 400, false) };
+  const authStartedAt = performance.now();
   const supabase = createServerSupabase();
   const { data: agent, error } = await supabase.from("ai_agents").select("id,restaurant_id,location_id,status").eq("retell_agent_id", agentId).neq("status", "disabled").limit(1).maybeSingle();
   if (error) { console.error("AI agent lookup", error); return { error: fail("AUTH_LOOKUP_FAILED", "The AI agent could not be authorized.", 500, false) }; }
@@ -55,6 +61,8 @@ async function authorize(request: Request): Promise<{ context?: AiContext; paylo
     if (locationError || !location) return { error: fail("LOCATION_NOT_CONFIGURED", "No active restaurant location is configured for this AI agent.", 409, false) };
     locationId = location.id;
   }
+  timing("get_restaurant_info", "authorization", authStartedAt);
+  timing("get_restaurant_info", "total_before_operation", startedAt);
   return { context: { supabase, agentId: agent.id, restaurantId: agent.restaurant_id, locationId }, payload, args };
 }
 
@@ -137,13 +145,21 @@ function assertScheduledOrderAllowed(info: any, scheduledFor?: string) {
 }
 
 async function restaurantInfo(supabase: any, restaurantId: string, locationId: string) {
-  const [{ data: restaurant, error: re }, { data: location, error: le }, { data: settings, error: se }, { data: hours, error: he }] = await Promise.all([
-    supabase.from("restaurants").select("id,name,phone,email,website_url,logo_url,timezone,max_online_party_size").eq("id", restaurantId).single(),
-    supabase.from("restaurant_locations").select("id,name,address_line1,city,province,postal_code,phone,email,is_active").eq("id", locationId).single(),
-    supabase.from("restaurant_settings").select("pickup_enabled,delivery_enabled,dine_in_enabled,scheduled_orders_enabled,large_order_approval_threshold,reservations_enabled,reservations_auto_confirm,reservations_max_auto_party_size,reservation_capacity,delivery_radius_km,delivery_minimum_order,free_delivery_threshold,delivery_distance_pricing,ai_enabled,ai_escalation_settings,ai_approval_rules").eq("restaurant_id", restaurantId).single(),
-    supabase.from("restaurant_hours").select("day_of_week,opens_at,closes_at,is_closed").eq("location_id", locationId).order("day_of_week"),
+  const stageStartedAt = performance.now();
+  const queryStartedAt = performance.now();
+  const [restaurantResult, locationResult, settingsResult, hoursResult] = await Promise.all([
+    (async () => { const startedAt = performance.now(); const result = await supabase.from("restaurants").select("id,name,phone,email,website_url,logo_url,timezone,max_online_party_size").eq("id", restaurantId).single(); timing("get_restaurant_info", "restaurant_query", startedAt); return result; })(),
+    (async () => { const startedAt = performance.now(); const result = await supabase.from("restaurant_locations").select("id,name,address_line1,city,province,postal_code,phone,email,is_active").eq("id", locationId).single(); timing("get_restaurant_info", "location_query", startedAt); return result; })(),
+    (async () => { const startedAt = performance.now(); const result = await supabase.from("restaurant_settings").select("pickup_enabled,delivery_enabled,dine_in_enabled,scheduled_orders_enabled,large_order_approval_threshold,reservations_enabled,reservations_auto_confirm,reservations_max_auto_party_size,reservation_capacity,delivery_radius_km,delivery_minimum_order,free_delivery_threshold,delivery_distance_pricing,ai_enabled,ai_escalation_settings,ai_approval_rules").eq("restaurant_id", restaurantId).single(); timing("get_restaurant_info", "settings_query", startedAt); return result; })(),
+    (async () => { const startedAt = performance.now(); const result = await supabase.from("restaurant_hours").select("day_of_week,opens_at,closes_at,is_closed").eq("location_id", locationId).order("day_of_week"); timing("get_restaurant_info", "hours_query", startedAt); return result; })(),
   ]);
+  timing("get_restaurant_info", "supabase_queries", queryStartedAt);
+  const { data: restaurant, error: re } = restaurantResult;
+  const { data: location, error: le } = locationResult;
+  const { data: settings, error: se } = settingsResult;
+  const { data: hours, error: he } = hoursResult;
   if (re || le || se || he || !restaurant || !location) throw new Error("Restaurant information is not configured");
+  timing("get_restaurant_info", "restaurant_info", stageStartedAt);
   return { restaurant, location, settings, hours: hours ?? [] };
 }
 
@@ -163,6 +179,7 @@ async function reservationAvailability(supabase: any, restaurantId: string, loca
 }
 
 export async function handleAiRequest(request: Request, operation: string[]) {
+  const totalStartedAt = performance.now();
   const auth = await authorize(request);
   if (auth.error) return auth.error;
   const { context, args, payload } = auth as { context: AiContext; args: JsonObject; payload: JsonObject };
@@ -170,7 +187,14 @@ export async function handleAiRequest(request: Request, operation: string[]) {
   const op = operation.join("/");
 
   try {
-    if (op === "restaurant") return response(await restaurantInfo(supabase, restaurantId, locationId));
+    if (op === "restaurant") {
+      const responseStartedAt = performance.now();
+      const info = await restaurantInfo(supabase, restaurantId, locationId);
+      const result = response(info);
+      timing("get_restaurant_info", "response_construction", responseStartedAt);
+      timing("get_restaurant_info", "total", totalStartedAt);
+      return result;
+    }
     if (op === "menu") {
       const input = z.object({ category: z.string().trim().max(100).optional(), item: z.string().trim().max(120).optional(), search: z.string().trim().max(120).optional(), modifier_group: z.string().trim().max(120).optional() }).parse(args);
       const info = await restaurantInfo(supabase, restaurantId, locationId);
@@ -227,7 +251,7 @@ export async function handleAiRequest(request: Request, operation: string[]) {
       const input=z.object({customer_name:z.string().trim().min(1).max(120),customer_phone:z.string().min(10).max(30),customer_email:z.string().email().max(320).optional(),party_size:z.coerce.number().int().min(1).max(50),requested_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),requested_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),seating_preference:z.enum(["indoor","patio","booth","no_preference"]).optional(),customer_notes:z.string().max(1000).optional(),special_request:z.string().max(1000).optional()}).parse(args);
       const phone=await resolveCustomerPhone(supabase,restaurantId,input.customer_phone);const info=await restaurantInfo(supabase,restaurantId,locationId);if(!info.settings?.reservations_enabled)return fail("RESERVATIONS_DISABLED","Reservations are currently unavailable.",409);const availability=await reservationAvailability(supabase,restaurantId,locationId,{party_size:input.party_size,requested_date:input.requested_date,requested_time:input.requested_time},info);if(availability.available===false)return fail("RESERVATION_UNAVAILABLE",availability.reason==="outside_restaurant_hours"?"The requested reservation time is outside restaurant hours.":availability.reason==="party_size_limit"?"That party size is above the restaurant's online reservation limit.":"That reservation time is not available.",409);const {data,error}=await supabase.rpc("create_reservation_atomic",{p_restaurant_id:restaurantId,p_location_id:locationId,p_customer_name:input.customer_name,p_customer_phone:phone,p_party_size:input.party_size,p_requested_date:input.requested_date,p_requested_time:input.requested_time,p_customer_notes:[input.customer_notes,input.special_request].filter(Boolean).join(" | ")||null,p_source:"ai_phone"});if(error)throw error;const reservationId=(data as any)?.id;if(reservationId){await supabase.from("reservations").update({seating_preference:input.seating_preference??null,customer_email:input.customer_email??null}).eq("id",reservationId).eq("restaurant_id",restaurantId);if(input.customer_email)await supabase.from("customers").update({email:input.customer_email,updated_at:new Date().toISOString()}).eq("restaurant_id",restaurantId).eq("phone_normalized",normalizePhone(phone));}return response({reservation:data,request_only:true,requires_staff_confirmation:true},201);
     }
-    if(op==="reservation/lookup"){const input=z.object({reservation_number:z.coerce.number().int().positive(),customer_phone:z.string().min(10).max(30)}).parse(args);const reservation=await loadReservation(supabase,restaurantId,locationId,input.reservation_number,input.customer_phone);if(!reservation)return fail("RESERVATION_NOT_FOUND","I could not find a reservation matching that reservation number and phone number.",404);return response({reservation});}
+    if(op==="reservation/lookup"){const input=z.object({reservation_number:z.coerce.number().int().positive(),customer_phone:z.string().min(10).max(30)}).parse(args);const reservation=await loadReservation(supabase,restaurantId,locationId,input.reservation_number,input.customer_phone);if(!reservation)return fail("RESERVATION_NOT_FOUND","I could not find a reservation matching that order number and phone number.",404);return response({reservation});}
     if(op==="reservation/update"){
       const input=z.object({reservation_number:z.coerce.number().int().positive(),customer_phone:z.string().min(10).max(30),operation:z.enum(["request_cancel","request_time_change"]),requested_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),requested_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/).optional(),note:z.string().max(1000).optional()}).parse(args);const reservation=await loadReservation(supabase,restaurantId,locationId,input.reservation_number,input.customer_phone);if(!reservation)return fail("RESERVATION_NOT_FOUND","I could not find a reservation matching that reservation number and phone number.",404);if(input.operation==="request_time_change"&&(!input.requested_date||!input.requested_time))return fail("REQUESTED_TIME_REQUIRED","A requested date and time are required for a reservation change request.");
       const requestText=input.operation==="request_cancel"?`Customer requested reservation cancellation${input.note?`: ${input.note}`:""}`:`Customer requested reservation change to ${input.requested_date} at ${input.requested_time}${input.note?`: ${input.note}`:""}`;const combined=[reservation.customer_notes,requestText].filter(Boolean).join(" | ");const {data,error}=await supabase.from("reservations").update({customer_notes:combined,updated_at:new Date().toISOString()}).eq("id",reservation.id).eq("restaurant_id",restaurantId).eq("location_id",locationId).select("*").single();if(error)throw error;await supabase.from("reservation_events").insert({reservation_id:reservation.id,from_status:reservation.status,to_status:reservation.status,actor_type:"ai_request",note:requestText});return response({reservation:data,request_only:true,requires_staff_confirmation:true});
