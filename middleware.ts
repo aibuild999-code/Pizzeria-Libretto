@@ -2,6 +2,12 @@ import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
 export async function middleware(request: NextRequest) {
+  // AI API routes use their own Retell signature + agent authorization.
+  // They must not be redirected through browser-session authentication.
+  if (request.nextUrl.pathname.startsWith("/api/ai/")) {
+    return NextResponse.next();
+  }
+
   let response = NextResponse.next({ request });
 
   const supabase = createServerClient(
