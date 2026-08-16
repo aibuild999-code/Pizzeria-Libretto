@@ -46,7 +46,7 @@ async function authorize(request: Request): Promise<{ context?: AiContext; paylo
   const agentId = agentIdFrom(payload, args);
   if (!agentId || typeof agentId !== "string") return { error: fail("AGENT_REQUIRED", "The authenticated AI request did not identify an agent.", 400, false) };
   const supabase = createServerSupabase();
-  const { data: agent, error } = await supabase.from("ai_agents").select("id,restaurant_id,location_id,status").eq("id", agentId).neq("status", "disabled").limit(1).maybeSingle();
+  const { data: agent, error } = await supabase.from("ai_agents").select("id,restaurant_id,location_id,status").eq("retell_agent_id", agentId).neq("status", "disabled").limit(1).maybeSingle();
   if (error) { console.error("AI agent lookup", error); return { error: fail("AUTH_LOOKUP_FAILED", "The AI agent could not be authorized.", 500, false) }; }
   if (!agent) return { error: fail("AGENT_NOT_AUTHORIZED", "This AI agent is not authorized.", 403, false) };
   let locationId = agent.location_id as string | null;
