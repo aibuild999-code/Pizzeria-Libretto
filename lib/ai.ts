@@ -43,7 +43,7 @@ async function authorize(request: Request): Promise<{ context?: AiContext; paylo
   const rawBody = await request.text();
   const signatureStartedAt = performance.now();
   const signatureValid = verifyRetellSignature(rawBody, request.headers.get("X-Retell-Signature"));
-  timing("get_restaurant_info", "signature_verification", signatureStartedAt);
+  timing("ai", "signature_verification", signatureStartedAt);
   if (!signatureValid) return { error: fail("UNAUTHORIZED", "This request is not an authenticated Retell request.", 401, false) };
   let payload: JsonObject;
   try { payload = JSON.parse(rawBody); } catch { return { error: fail("INVALID_JSON", "The AI request body is not valid JSON.", 400, false) }; }
@@ -52,8 +52,17 @@ async function authorize(request: Request): Promise<{ context?: AiContext; paylo
   if (!agentId || typeof agentId !== "string") return { error: fail("AGENT_REQUIRED", "The authenticated AI request did not identify an agent.", 400, false) };
   const authStartedAt = performance.now();
   const supabase = createServerSupabase();
-  const { data: agent, error } = await supabase.from("ai_agents").select("id,restaurant_id,location_id,status").eq("retell_agent_id", agentId).neq("status", "disabled").limit(1).maybeSingle();
-  if (error) { console.error("AI agent lookup", error); return { error: fail("AUTH_LOOKUP_FAILED", "The AI agent could not be authorized.", 500, false) }; }
+  const lookup = async () => supabase.from("ai_agents").select("id,restaurant_id,location_id,status").eq("retell_agent_id", agentId).neq("status", "disabled").limit(1).maybeSingle();
+  let { data: agent, error } = await lookup();
+  if (error) {
+    console.warn(`[AI_AUTH] agent_lookup_failed_first agent_id=${agentId} error_code=${error.code ?? "unknown"}`);
+    console.info(`[AI_AUTH] agent_lookup_retry agent_id=${agentId}`);
+    ({ data: agent, error } = await lookup());
+  }
+  if (error) {
+    console.error(`[AI_AUTH] agent_lookup_failed_final agent_id=${agentId} error_code=${error.code ?? "unknown"}`);
+    return { error: fail("AUTH_LOOKUP_FAILED", "The AI agent could not be authorized.", 500, false) };
+  }
   if (!agent) return { error: fail("AGENT_NOT_AUTHORIZED", "This AI agent is not authorized.", 403, false) };
   let locationId = agent.location_id as string | null;
   if (!locationId) {
@@ -61,8 +70,8 @@ async function authorize(request: Request): Promise<{ context?: AiContext; paylo
     if (locationError || !location) return { error: fail("LOCATION_NOT_CONFIGURED", "No active restaurant location is configured for this AI agent.", 409, false) };
     locationId = location.id;
   }
-  timing("get_restaurant_info", "authorization", authStartedAt);
-  timing("get_restaurant_info", "total_before_operation", startedAt);
+  timing("ai", "authorization", authStartedAt);
+  timing("ai", "total_before_operation", startedAt);
   return { context: { supabase, agentId: agent.id, restaurantId: agent.restaurant_id, locationId }, payload, args };
 }
 
@@ -73,7 +82,7 @@ function userError(error: unknown) {
     ["selection count", "The number of selections is outside the allowed range."], ["invalid or unavailable size", "That size is not available for this item."],
     ["invalid or unavailable modifier", "That modifier is not available for this item."], ["maximum online party size", "That party size is above the restaurant's online reservation limit."],
     ["does not belong", "I could not verify that record belongs to this customer."], ["can no longer be modified", "This order can no longer be modified."],
-    ["can no longer be cancelled", "This order can no longer be cancelled."], ["cannot be cancelled", "This order can no longer be cancelled."], ["outside restaurant hours", "The requested time is outside restaurant hours."],
+    ["can no longer be cancelled", "This order can no longer be cancelled."], ["cannot be cancelled", "This order can no longer be cancelled."], ["outside restaurant hours", "The restaurant is outside restaurant hours."],
     ["invalid customer phone", "I need a valid 10-digit North American phone number before I can continue."],
     ["delivery distance validation is not configured", "Delivery is not currently available because the restaurant delivery area has not been configured."],
     ["delivery area is not configured", "Delivery is not currently available because the restaurant delivery area has not been configured."],
@@ -178,6 +187,29 @@ async function reservationAvailability(supabase: any, restaurantId: string, loca
   return { available:capacityAvailable, availability_verifiable:capacity!==null, capacity_configured:capacity!==null, capacity_remaining:capacity===null ? null : Math.max(capacity-used,0), requires_manual_confirmation:true, requested_date:input.requested_date, requested_time:input.requested_time };
 }
 
+function normalizeMenuSearch(search: string): string[] {
+  const stopWords = new Set(["a","an","and","for","i","in","is","me","of","on","one","please","the","to","want","with"]);
+  return Array.from(new Set(search.toLowerCase().replace(/[^a-z0-9]+/g, " ").split(/\s+/).filter(token => token.length > 1 && !stopWords.has(token))));
+}
+
+function menuCandidateMatches(item: any, categoryName: string | undefined, tokens: string[]): boolean {
+  const searchable = [item.name, item.description, categoryName].filter(Boolean).join(" ").toLowerCase().replace(/[^a-z0-9]+/g, " ");
+  return tokens.every(token => searchable.split(/\s+/).includes(token) || searchable.includes(token));
+}
+
+async function searchMenuItems(supabase: any, categories: any[], search: string) {
+  const categoryIds = categories.map((c:any) => c.id);
+  const categoryMap = new Map(categories.map((c:any) => [c.id, c.name]));
+  const exact = await supabase.from("menu_items").select("id,category_id,name,description,price,dietary_tags,is_available,item_type").in("category_id",categoryIds.length?categoryIds:["00000000-0000-0000-0000-000000000000"]).order("display_order").limit(30).or(`name.ilike.%${search}%,description.ilike.%${search}%`);
+  if (exact.error) throw exact.error;
+  if ((exact.data ?? []).length > 0) return exact.data;
+  const tokens = normalizeMenuSearch(search);
+  if (!tokens.length) return [];
+  const { data: candidates, error } = await supabase.from("menu_items").select("id,category_id,name,description,price,dietary_tags,is_available,item_type").in("category_id",categoryIds.length?categoryIds:["00000000-0000-0000-0000-000000000000"]).order("display_order").limit(100);
+  if (error) throw error;
+  return (candidates ?? []).filter((item:any) => menuCandidateMatches(item, categoryMap.get(item.category_id), tokens)).slice(0,30);
+}
+
 export async function handleAiRequest(request: Request, operation: string[]) {
   const totalStartedAt = performance.now();
   const auth = await authorize(request);
@@ -196,26 +228,65 @@ export async function handleAiRequest(request: Request, operation: string[]) {
       return result;
     }
     if (op === "menu") {
+      const menuStartedAt = performance.now();
       const input = z.object({ category: z.string().trim().max(100).optional(), item: z.string().trim().max(120).optional(), search: z.string().trim().max(120).optional(), modifier_group: z.string().trim().max(120).optional() }).parse(args);
-      const info = await restaurantInfo(supabase, restaurantId, locationId);
+      timing("get_menu", "input_validation", menuStartedAt);
+      const categoryQueryStartedAt = performance.now();
       let categoryQuery = supabase.from("menu_categories").select("id,name").eq("restaurant_id", restaurantId).eq("is_active", true).order("display_order");
       if (input.category) categoryQuery = categoryQuery.ilike("name", `%${input.category}%`);
-      const { data: categories, error: categoryError } = await categoryQuery; if (categoryError) throw categoryError;
-      const categoryIds = (categories ?? []).map((c:any)=>c.id);
-      let itemQuery = supabase.from("menu_items").select("id,category_id,name,description,price,dietary_tags,is_available,item_type").in("category_id",categoryIds.length?categoryIds:["00000000-0000-0000-0000-000000000000"]).order("display_order").limit(30);
-      if (input.item) itemQuery=itemQuery.ilike("name",`%${input.item}%`); else if (input.search) itemQuery=itemQuery.or(`name.ilike.%${input.search}%,description.ilike.%${input.search}%`);
-      const { data: items, error: itemError } = await itemQuery; if(itemError) throw itemError;
+      const [restaurantResult, categoryResult] = await Promise.all([
+        supabase.from("restaurants").select("id,name").eq("id", restaurantId).single(),
+        categoryQuery,
+      ]);
+      timing("get_menu", "restaurant_and_categories", categoryQueryStartedAt);
+      if (restaurantResult.error || !restaurantResult.data) throw restaurantResult.error ?? new Error("Restaurant information is not configured");
+      if (categoryResult.error) throw categoryResult.error;
+      const restaurant = restaurantResult.data;
+      const categories = categoryResult.data ?? [];
+      let items;
+      const itemSearchStartedAt = performance.now();
+      if (input.item) {
+        const itemQuery = supabase.from("menu_items").select("id,category_id,name,description,price,dietary_tags,is_available,item_type").in("category_id",categories.length?categories.map((c:any)=>c.id):["00000000-0000-0000-0000-000000000000"]).order("display_order").limit(30).ilike("name",`%${input.item}%`);
+        const result = await itemQuery; if (result.error) throw result.error; items = result.data ?? [];
+      } else if (input.search) {
+        items = await searchMenuItems(supabase, categories, input.search);
+      } else {
+        const itemQuery = supabase.from("menu_items").select("id,category_id,name,description,price,dietary_tags,is_available,item_type").in("category_id",categories.length?categories.map((c:any)=>c.id):["00000000-0000-0000-0000-000000000000"]).order("display_order").limit(30);
+        const result = await itemQuery; if (result.error) throw result.error; items = result.data ?? [];
+      }
+      timing("get_menu", "item_search", itemSearchStartedAt);
       const itemIds=(items??[]).map((i:any)=>i.id);
-      const [{data:sizes},{data:links},{data:groups}]=await Promise.all([
+      const relationshipStartedAt = performance.now();
+      const [sizesResult, linksResult] = await Promise.all([
         supabase.from("menu_item_sizes").select("id,menu_item_id,name,price,is_available").in("menu_item_id",itemIds.length?itemIds:["00000000-0000-0000-0000-000000000000"]).order("display_order"),
         supabase.from("menu_item_modifier_groups").select("menu_item_id,modifier_group_id,min_selections,max_selections,required,free_selections").in("menu_item_id",itemIds.length?itemIds:["00000000-0000-0000-0000-000000000000"]),
-        supabase.from("modifier_groups").select("id,name,description,selection_type,min_selections,max_selections").eq("restaurant_id",restaurantId).eq("is_active",true).order("display_order")]);
-      const groupIds=(links??[]).map((l:any)=>l.modifier_group_id);
-      let modifierQuery=supabase.from("modifiers").select("id,modifier_group_id,name,description,price_delta,max_quantity,is_available,action").in("modifier_group_id",groupIds.length?groupIds:["00000000-0000-0000-0000-000000000000"]).order("display_order");
-      if(input.modifier_group) modifierQuery=modifierQuery.ilike("name",`%${input.modifier_group}%`);
-      const {data:modifiers,error:modifierError}=await modifierQuery; if(modifierError) throw modifierError;
-      const categoryMap=new Map((categories??[]).map((c:any)=>[c.id,c.name]));
-      return response({restaurant:{id:info.restaurant.id,name:info.restaurant.name},categories:(categories??[]).map((c:any)=>({id:c.id,name:c.name})),items:(items??[]).map((item:any)=>({id:item.id,category:categoryMap.get(item.category_id),name:item.name,description:item.description,base_price:item.price,dietary_tags:item.dietary_tags,available:item.is_available,item_type:item.item_type,sizes:(sizes??[]).filter((s:any)=>s.menu_item_id===item.id),modifier_groups:(links??[]).filter((l:any)=>l.menu_item_id===item.id).map((l:any)=>({...l,group:(groups??[]).find((g:any)=>g.id===l.modifier_group_id)??null,modifiers:(modifiers??[]).filter((m:any)=>m.modifier_group_id===l.modifier_group_id)}))}))});
+      ]);
+      if (sizesResult.error) throw sizesResult.error;
+      if (linksResult.error) throw linksResult.error;
+      const sizes=sizesResult.data ?? [];
+      const links=linksResult.data ?? [];
+      const groupIds=Array.from(new Set(links.map((l:any)=>l.modifier_group_id)));
+      let groups:any[]=[];
+      let modifiers:any[]=[];
+      if (groupIds.length) {
+        const modifierQueryBase = supabase.from("modifiers").select("id,modifier_group_id,name,description,price_delta,max_quantity,is_available,action").in("modifier_group_id",groupIds).order("display_order");
+        const modifierQuery = input.modifier_group ? modifierQueryBase.ilike("name",`%${input.modifier_group}%`) : modifierQueryBase;
+        const [groupsResult, modifiersResult] = await Promise.all([
+          supabase.from("modifier_groups").select("id,name,description,selection_type,min_selections,max_selections").in("id",groupIds).eq("is_active",true).order("display_order"),
+          modifierQuery,
+        ]);
+        if (groupsResult.error) throw groupsResult.error;
+        if (modifiersResult.error) throw modifiersResult.error;
+        groups=groupsResult.data ?? [];
+        modifiers=modifiersResult.data ?? [];
+      }
+      timing("get_menu", "sizes_and_modifier_relationships", relationshipStartedAt);
+      const categoryMap=new Map(categories.map((c:any)=>[c.id,c.name]));
+      const responseStartedAt = performance.now();
+      const result = response({restaurant:{id:restaurant.id,name:restaurant.name},categories:categories.map((c:any)=>({id:c.id,name:c.name})),items:(items??[]).map((item:any)=>({id:item.id,category:categoryMap.get(item.category_id),name:item.name,description:item.description,base_price:item.price,dietary_tags:item.dietary_tags,available:item.is_available,item_type:item.item_type,sizes:sizes.filter((s:any)=>s.menu_item_id===item.id),modifier_groups:links.filter((l:any)=>l.menu_item_id===item.id).map((l:any)=>({...l,group:groups.find((g:any)=>g.id===l.modifier_group_id)??null,modifiers:modifiers.filter((m:any)=>m.modifier_group_id===l.modifier_group_id)}))}))});
+      timing("get_menu", "response_construction", responseStartedAt);
+      timing("get_menu", "total", totalStartedAt);
+      return result;
     }
     if (op === "menu/availability") {
       const input=z.object({menu_item_id:z.string().uuid(),size_id:z.string().uuid().optional(),modifier_ids:z.array(z.string().uuid()).optional(),scheduled_for:z.string().datetime().optional()}).parse(args);
@@ -245,13 +316,13 @@ export async function handleAiRequest(request: Request, operation: string[]) {
       const quoteInput={customer_name:input.customer_name??order.customer_name,customer_phone:phone,customer_email:input.customer_email??order.customer_email,fulfillment_type:fulfillment,notes:input.notes??order.notes,scheduled_for:input.scheduled_for??order.scheduled_for,delivery_address_line1:input.delivery_address_line1??order.delivery_address_line1,delivery_address_line2:input.delivery_address_line2??order.delivery_address_line2,delivery_city:input.delivery_city??order.delivery_city,delivery_province:input.delivery_province??order.delivery_province,delivery_postal_code:input.delivery_postal_code??order.delivery_postal_code,delivery_instructions:input.delivery_instructions??order.delivery_instructions,table_number:input.table_number??order.table_number,items:input.items}; const expectedQuoteToken=quoteToken(quoteInput); if(!timingSafeEqual(Buffer.from(expectedQuoteToken),Buffer.from(input.quote_token)))return fail("QUOTE_MISMATCH","The order changed, so the total must be recalculated before applying the change.",409,true);
       const {data,error}=await supabase.rpc("modify_ai_order_atomic",{p_agent_id:agentId,p_restaurant_id:restaurantId,p_location_id:locationId,p_order_id:order.id,p_customer_phone:phone,p_customer_name:quoteInput.customer_name,p_customer_email:quoteInput.customer_email,p_fulfillment_type:quoteInput.fulfillment_type,p_notes:quoteInput.notes,p_scheduled_for:quoteInput.scheduled_for,p_delivery_address_line1:quoteInput.delivery_address_line1,p_delivery_address_line2:quoteInput.delivery_address_line2,p_delivery_city:quoteInput.delivery_city,p_delivery_province:quoteInput.delivery_province,p_delivery_postal_code:quoteInput.delivery_postal_code,p_delivery_instructions:quoteInput.delivery_instructions,p_table_number:quoteInput.table_number,p_items:input.items});if(error)throw error;return response({order:data});
     }
-    if(op==="order/cancel"){const input=z.object({order_number:z.coerce.number().int().positive(),customer_phone:z.string().min(10).max(30),reason:z.string().max(500).optional()}).parse(args);const order=await loadOrder(supabase,restaurantId,locationId,input.order_number,input.customer_phone);if(!order)return fail("ORDER_NOT_FOUND","I could not find an order matching that order number and phone number.",404);const {data,error}=await supabase.rpc("cancel_ai_order",{p_agent_id:agentId,p_restaurant_id:restaurantId,p_location_id:locationId,p_order_id:order.id,p_customer_phone:requirePhone(input.customer_phone),p_reason:input.reason??null});if(error)throw error;return response({order:data});}
+    if(op==="order/cancel"){const input=z.object({order_number:z.coerce.number().int().positive(),customer_phone:z.string().min(10).max(30),reason:z.string().max(500).optional()}).parse(args);const order=await loadOrder(supabase,restaurantId,locationId,input.order_number,input.customer_phone);if(!order)return fail("ORDER_NOT_FOUND","I could not find an order matching that order number and phone number.",404);const {data,error}=await supabase.rpc("cancel_ai_order",{p_agent_id:agentId,p_restaurant_id:restaurantId,p_location_id:locationId,p_order_id:order.id,p_customer_phone:requirePhone(input.customer_phone),p_reason:input.reason??null});if(error)throw error;return response({order});}
     if(op==="reservation/check"){const input=z.object({party_size:z.coerce.number().int().min(1).max(50),requested_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),requested_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/)}).parse(args);return response(await reservationAvailability(supabase,restaurantId,locationId,input));}
     if(op==="reservation/create"){
       const input=z.object({customer_name:z.string().trim().min(1).max(120),customer_phone:z.string().min(10).max(30),customer_email:z.string().email().max(320).optional(),party_size:z.coerce.number().int().min(1).max(50),requested_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),requested_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),seating_preference:z.enum(["indoor","patio","booth","no_preference"]).optional(),customer_notes:z.string().max(1000).optional(),special_request:z.string().max(1000).optional()}).parse(args);
       const phone=await resolveCustomerPhone(supabase,restaurantId,input.customer_phone);const info=await restaurantInfo(supabase,restaurantId,locationId);if(!info.settings?.reservations_enabled)return fail("RESERVATIONS_DISABLED","Reservations are currently unavailable.",409);const availability=await reservationAvailability(supabase,restaurantId,locationId,{party_size:input.party_size,requested_date:input.requested_date,requested_time:input.requested_time},info);if(availability.available===false)return fail("RESERVATION_UNAVAILABLE",availability.reason==="outside_restaurant_hours"?"The requested reservation time is outside restaurant hours.":availability.reason==="party_size_limit"?"That party size is above the restaurant's online reservation limit.":"That reservation time is not available.",409);const {data,error}=await supabase.rpc("create_reservation_atomic",{p_restaurant_id:restaurantId,p_location_id:locationId,p_customer_name:input.customer_name,p_customer_phone:phone,p_party_size:input.party_size,p_requested_date:input.requested_date,p_requested_time:input.requested_time,p_customer_notes:[input.customer_notes,input.special_request].filter(Boolean).join(" | ")||null,p_source:"ai_phone"});if(error)throw error;const reservationId=(data as any)?.id;if(reservationId){await supabase.from("reservations").update({seating_preference:input.seating_preference??null,customer_email:input.customer_email??null}).eq("id",reservationId).eq("restaurant_id",restaurantId);if(input.customer_email)await supabase.from("customers").update({email:input.customer_email,updated_at:new Date().toISOString()}).eq("restaurant_id",restaurantId).eq("phone_normalized",normalizePhone(phone));}return response({reservation:data,request_only:true,requires_staff_confirmation:true},201);
     }
-    if(op==="reservation/lookup"){const input=z.object({reservation_number:z.coerce.number().int().positive(),customer_phone:z.string().min(10).max(30)}).parse(args);const reservation=await loadReservation(supabase,restaurantId,locationId,input.reservation_number,input.customer_phone);if(!reservation)return fail("RESERVATION_NOT_FOUND","I could not find a reservation matching that order number and phone number.",404);return response({reservation});}
+    if(op==="reservation/lookup"){const input=z.object({reservation_number:z.coerce.number().int().positive(),customer_phone:z.string().min(10).max(30)}).parse(args);const reservation=await loadReservation(supabase,restaurantId,locationId,input.reservation_number,input.customer_phone);if(!reservation)return fail("RESERVATION_NOT_FOUND","I could not find a reservation matching that reservation number and phone number.",404);return response({reservation});}
     if(op==="reservation/update"){
       const input=z.object({reservation_number:z.coerce.number().int().positive(),customer_phone:z.string().min(10).max(30),operation:z.enum(["request_cancel","request_time_change"]),requested_date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),requested_time:z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/).optional(),note:z.string().max(1000).optional()}).parse(args);const reservation=await loadReservation(supabase,restaurantId,locationId,input.reservation_number,input.customer_phone);if(!reservation)return fail("RESERVATION_NOT_FOUND","I could not find a reservation matching that reservation number and phone number.",404);if(input.operation==="request_time_change"&&(!input.requested_date||!input.requested_time))return fail("REQUESTED_TIME_REQUIRED","A requested date and time are required for a reservation change request.");
       const requestText=input.operation==="request_cancel"?`Customer requested reservation cancellation${input.note?`: ${input.note}`:""}`:`Customer requested reservation change to ${input.requested_date} at ${input.requested_time}${input.note?`: ${input.note}`:""}`;const combined=[reservation.customer_notes,requestText].filter(Boolean).join(" | ");const {data,error}=await supabase.from("reservations").update({customer_notes:combined,updated_at:new Date().toISOString()}).eq("id",reservation.id).eq("restaurant_id",restaurantId).eq("location_id",locationId).select("*").single();if(error)throw error;await supabase.from("reservation_events").insert({reservation_id:reservation.id,from_status:reservation.status,to_status:reservation.status,actor_type:"ai_request",note:requestText});return response({reservation:data,request_only:true,requires_staff_confirmation:true});
