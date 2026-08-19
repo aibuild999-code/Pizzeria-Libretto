@@ -10,7 +10,7 @@ create table if not exists public.ai_working_orders (
   quote_token text,
   quote_payload jsonb,
   quote_result jsonb,
-  status text not null default 'building' check (status in ('building','quoted','created','abandoned')),
+  status text not null default 'building' check (status in ('building','quoted','creating','created','abandoned')),
   created_order_id uuid references public.orders(id) on delete set null,
   expires_at timestamptz not null default (now() + interval '4 hours'),
   created_at timestamptz not null default now(),
