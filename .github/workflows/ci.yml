@@ -44,6 +44,8 @@ jobs:
         run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/working-order.integration.sql
       - name: Attack simultaneous update and create races
         run: bash tests/run-concurrency-tests.sh
+      - name: Install size-specific modifier rule fixture
+        run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/size-rules-fixture.sql
       - name: Install local quote/create RPC equivalents for HTTP simulation
         run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/http-rpc-fixture.sql
       - name: Generate local service-role JWT
