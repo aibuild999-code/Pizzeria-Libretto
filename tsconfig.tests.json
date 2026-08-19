@@ -14,6 +14,7 @@
   },
   "include": [
     "lib/working-order-core.ts",
+    "lib/ai-operation-router.ts",
     "tests/working-order-core.test.ts"
   ]
 }
