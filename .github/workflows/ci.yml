@@ -54,9 +54,10 @@ jobs:
           TOKEN=$(node - <<'NODE'
           const crypto = require('crypto');
           const secret = process.env.TEST_JWT_SECRET;
+          const now = Math.floor(Date.now()/1000);
           const b64 = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
           const header = b64({ alg: 'HS256', typ: 'JWT' });
-          const payload = b64({ role: 'service_role', exp: Math.floor(Date.now()/1000) + 3600 });
+          const payload = b64({ iss: 'supabase', role: 'service_role', iat: now, exp: now + 3600 });
           const body = `${header}.${payload}`;
           const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
           process.stdout.write(`${body}.${sig}`);
@@ -76,6 +77,15 @@ jobs:
           for i in {1..30}; do nc -z 127.0.0.1 3001 && exit 0; sleep 1; done
           docker logs local-postgrest
           exit 1
+      - name: Verify service-role API can read the agent fixture
+        shell: bash
+        run: |
+          BODY=$(curl -fsS \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            "http://127.0.0.1:3001/ai_agents?retell_agent_id=eq.retell-agent-a1&select=id,retell_agent_id")
+          echo "$BODY"
+          node -e 'const rows=JSON.parse(process.argv[1]); if(rows.length!==1) process.exit(1)' "$BODY"
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build
