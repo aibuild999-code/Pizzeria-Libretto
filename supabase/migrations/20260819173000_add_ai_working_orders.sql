@@ -5,7 +5,7 @@ create table if not exists public.ai_working_orders (
   restaurant_id uuid not null references public.restaurants(id) on delete cascade,
   location_id uuid not null references public.restaurant_locations(id) on delete cascade,
   items jsonb not null default '[]'::jsonb,
-  revision integer not null default 0,
+  revision integer not null default 0 check (revision >= 0),
   quoted_revision integer,
   quote_token text,
   quote_payload jsonb,
@@ -15,11 +15,13 @@ create table if not exists public.ai_working_orders (
   expires_at timestamptz not null default (now() + interval '4 hours'),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  unique (restaurant_id, call_id)
+  unique (restaurant_id, location_id, call_id)
 );
 
 create index if not exists ai_working_orders_call_lookup_idx
   on public.ai_working_orders (restaurant_id, location_id, call_id);
+create index if not exists ai_working_orders_agent_scope_idx
+  on public.ai_working_orders (agent_id, restaurant_id, location_id, call_id);
 create index if not exists ai_working_orders_expiry_idx
   on public.ai_working_orders (expires_at);
 
@@ -28,4 +30,4 @@ revoke all on table public.ai_working_orders from anon, authenticated;
 grant select, insert, update, delete on table public.ai_working_orders to service_role;
 
 comment on table public.ai_working_orders is
-  'Server-only, call-scoped order state used by authenticated AI voice tools. Menu/pricing tables remain authoritative.';
+  'Server-only state: exactly one working order per restaurant + location + Retell call_id; bound to the creating AI agent.';
