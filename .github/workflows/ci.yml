@@ -38,6 +38,8 @@ jobs:
         run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20260819173000_add_ai_working_orders.sql
       - name: Run actual working-order database integration tests
         run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/working-order.integration.sql
+      - name: Attack simultaneous update and create races
+        run: bash tests/run-concurrency-tests.sh
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build
