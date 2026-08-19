@@ -29,6 +29,24 @@ type Line = {
   special_instructions?: string;
   selections: Selection[];
 };
+type WorkingOrderState = {
+  id: string;
+  call_id: string;
+  agent_id: string;
+  restaurant_id: string;
+  location_id: string;
+  items: Line[];
+  revision: number;
+  quoted_revision: number | null;
+  quote_token: string | null;
+  quote_payload: Json | null;
+  quote_result: Json | null;
+  status: "building" | "quoted" | "creating" | "created" | "abandoned";
+  created_order_id: string | null;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+};
 type ResolvedItemResult =
   | { ok: true; item: any; size: any | null }
   | { ok: false; error: NextResponse };
@@ -70,6 +88,13 @@ function normalizePhone(phone: string) {
 
 function lineId() {
   return `li_${randomUUID()}`;
+}
+
+function workingOrders(c: Context) {
+  // The migration is intentionally not applied to production yet, so generated
+  // database types do not contain this table until promotion. Keep the escape
+  // hatch isolated to this one server-only table instead of weakening all DB types.
+  return (c.supabase as any).from("ai_working_orders");
 }
 
 async function auth(request: Request): Promise<Context | NextResponse> {
@@ -130,9 +155,8 @@ async function auth(request: Request): Promise<Context | NextResponse> {
   };
 }
 
-async function findState(c: Context) {
-  const { data, error } = await c.supabase
-    .from("ai_working_orders")
+async function findState(c: Context): Promise<WorkingOrderState | null> {
+  const { data, error } = await workingOrders(c)
     .select("*")
     .eq("restaurant_id", c.restaurantId)
     .eq("location_id", c.locationId)
@@ -140,16 +164,19 @@ async function findState(c: Context) {
     .limit(1)
     .maybeSingle();
   if (error) throw error;
-  if (data && new Date(data.expires_at).getTime() < Date.now()) throw new Error("WORKING_ORDER_EXPIRED");
-  return data;
+  const state = (data ?? null) as WorkingOrderState | null;
+  if (state && new Date(state.expires_at).getTime() < Date.now()) throw new Error("WORKING_ORDER_EXPIRED");
+  return state;
 }
 
-async function getState(c: Context, create = true) {
+async function getState(c: Context): Promise<WorkingOrderState>;
+async function getState(c: Context, create: true): Promise<WorkingOrderState>;
+async function getState(c: Context, create: false): Promise<WorkingOrderState | null>;
+async function getState(c: Context, create = true): Promise<WorkingOrderState | null> {
   const existing = await findState(c);
   if (existing || !create) return existing;
 
-  const { data: created, error: createError } = await c.supabase
-    .from("ai_working_orders")
+  const { data: created, error: createError } = await workingOrders(c)
     .insert({
       call_id: c.callId,
       agent_id: c.agentId,
@@ -159,7 +186,7 @@ async function getState(c: Context, create = true) {
     .select("*")
     .single();
 
-  if (!createError && created) return created;
+  if (!createError && created) return created as WorkingOrderState;
   if (createError?.code === "23505") {
     const raced = await findState(c);
     if (raced) return raced;
@@ -167,9 +194,8 @@ async function getState(c: Context, create = true) {
   throw createError ?? new Error("WORKING_ORDER_CREATE_FAILED");
 }
 
-async function save(c: Context, state: any, items: Line[]) {
-  const { data, error } = await c.supabase
-    .from("ai_working_orders")
+async function save(c: Context, state: WorkingOrderState, items: Line[]) {
+  const { data, error } = await workingOrders(c)
     .update({
       items,
       revision: Number(state.revision) + 1,
@@ -188,19 +214,27 @@ async function save(c: Context, state: any, items: Line[]) {
     .maybeSingle();
   if (error) throw error;
   if (!data) throw new Error("WORKING_ORDER_CONFLICT");
-  return data;
+  return data as WorkingOrderState;
 }
 
 async function resolveItem(c: Context, name: string, sizeName?: string): Promise<ResolvedItemResult> {
+  const { data: categories, error: categoryError } = await c.supabase
+    .from("menu_categories")
+    .select("id")
+    .eq("restaurant_id", c.restaurantId)
+    .eq("is_active", true);
+  if (categoryError) throw categoryError;
+  const categoryIds = (categories ?? []).map((category) => category.id);
+
   const { data: items, error } = await c.supabase
     .from("menu_items")
     .select("id,name,price,is_available,category_id,item_type")
-    .eq("restaurant_id", c.restaurantId)
+    .in("category_id", categoryIds.length ? categoryIds : [ZERO])
     .ilike("name", name.trim())
     .limit(5);
   if (error) throw error;
 
-  const available = (items ?? []).filter((item: any) => item.is_available);
+  const available = (items ?? []).filter((item) => item.is_available);
   if (available.length === 0) {
     return { ok: false, error: fail("ITEM_NOT_FOUND", "I could not find an available menu item with that name.", 404) };
   }
@@ -217,10 +251,10 @@ async function resolveItem(c: Context, name: string, sizeName?: string): Promise
     .order("display_order");
   if (sizeError) throw sizeError;
 
-  const availableSizes = (sizes ?? []).filter((candidate: any) => candidate.is_available);
+  const availableSizes = (sizes ?? []).filter((candidate) => candidate.is_available);
   if (sizeName) {
     const matches = availableSizes.filter(
-      (candidate: any) => candidate.name.toLowerCase() === sizeName.trim().toLowerCase(),
+      (candidate) => candidate.name.toLowerCase() === sizeName.trim().toLowerCase(),
     );
     if (matches.length !== 1) {
       return { ok: false, error: fail("SIZE_NOT_FOUND", "That size is not available for this item.", 409) };
@@ -247,7 +281,7 @@ async function resolveSelections(
     .select("modifier_group_id")
     .eq("menu_item_id", itemId);
   if (linkError) throw linkError;
-  const groupIds = (links ?? []).map((link: any) => link.modifier_group_id);
+  const groupIds = (links ?? []).map((link) => link.modifier_group_id);
 
   const { data: modifiers, error } = await c.supabase
     .from("modifiers")
@@ -259,7 +293,7 @@ async function resolveSelections(
   const selections: Selection[] = [];
   for (const requested of modifierNames) {
     const matches = (modifiers ?? []).filter(
-      (modifier: any) => modifier.name.toLowerCase() === requested.trim().toLowerCase(),
+      (modifier) => modifier.name.toLowerCase() === requested.trim().toLowerCase(),
     );
     if (matches.length !== 1) {
       return {
@@ -345,7 +379,7 @@ export async function handleWorkingOrderRequest(request: Request, operation: str
       if (selectionResult.error) return selectionResult.error;
 
       const items = [
-        ...(state.items as Line[]),
+        ...state.items,
         {
           line_id: lineId(),
           menu_item_id: resolved.item.id,
@@ -368,7 +402,7 @@ export async function handleWorkingOrderRequest(request: Request, operation: str
       if (state.status === "creating") return fail("ORDER_CREATE_IN_PROGRESS", "This order is already being created.", 409, true);
       if (state.status === "created") return fail("ORDER_ALREADY_CREATED", "This call already created an order.", 409, false);
 
-      const items = [...(state.items as Line[])];
+      const items = [...state.items];
       const index = items.findIndex((line) => line.line_id === input.line_id);
       if (index < 0) return fail("LINE_ITEM_NOT_FOUND", "That working-order line item could not be found.", 404);
 
@@ -408,8 +442,8 @@ export async function handleWorkingOrderRequest(request: Request, operation: str
       if (state.status === "creating") return fail("ORDER_CREATE_IN_PROGRESS", "This order is already being created.", 409, true);
       if (state.status === "created") return fail("ORDER_ALREADY_CREATED", "This call already created an order.", 409, false);
 
-      const items = (state.items as Line[]).filter((line) => line.line_id !== input.line_id);
-      if (items.length === (state.items as Line[]).length) {
+      const items = state.items.filter((line) => line.line_id !== input.line_id);
+      if (items.length === state.items.length) {
         return fail("LINE_ITEM_NOT_FOUND", "That working-order line item could not be found.", 404);
       }
       const saved = await save(c, state, items);
@@ -419,7 +453,7 @@ export async function handleWorkingOrderRequest(request: Request, operation: str
     if (op === "order/quote") {
       const input = quoteSchema.parse(c.args);
       const state = await getState(c, false);
-      const items = (state?.items ?? []) as Line[];
+      const items = state?.items ?? [];
       if (!state || items.length === 0) {
         return fail("ORDER_NOT_READY", "The order has no resolved line items. Resolve the customer's items before calculating a total.", 409);
       }
@@ -451,8 +485,7 @@ export async function handleWorkingOrderRequest(request: Request, operation: str
       if (error) throw error;
 
       const quoteToken = token(payload);
-      const { data: quotedState, error: updateError } = await c.supabase
-        .from("ai_working_orders")
+      const { data: quotedState, error: updateError } = await workingOrders(c)
         .update({
           quoted_revision: state.revision,
           quote_token: quoteToken,
@@ -494,8 +527,7 @@ export async function handleWorkingOrderRequest(request: Request, operation: str
       }
 
       if (state.status === "quoted") {
-        const { data: claimed, error: claimError } = await c.supabase
-          .from("ai_working_orders")
+        const { data: claimed, error: claimError } = await workingOrders(c)
           .update({ status: "creating", updated_at: new Date().toISOString() })
           .eq("id", state.id)
           .eq("revision", state.revision)
@@ -508,8 +540,8 @@ export async function handleWorkingOrderRequest(request: Request, operation: str
         if (!claimed) return fail("ORDER_NOT_READY", "The working order changed before it could be created. Calculate the order again.", 409);
       }
 
-      const quotePayload = state.quote_payload as Json;
-      const items = rpcItems(state.items as Line[]);
+      const quotePayload = state.quote_payload;
+      const items = rpcItems(state.items);
       const requestHash = hash({ ...quotePayload, items });
       const idempotencyKey = input.idempotency_key ?? hash(`${c.callId}:order.create:${requestHash}`).slice(0, 48);
 
@@ -535,8 +567,7 @@ export async function handleWorkingOrderRequest(request: Request, operation: str
       });
 
       if (error) {
-        await c.supabase
-          .from("ai_working_orders")
+        await workingOrders(c)
           .update({ status: "quoted", updated_at: new Date().toISOString() })
           .eq("id", state.id)
           .eq("revision", state.revision)
@@ -545,8 +576,7 @@ export async function handleWorkingOrderRequest(request: Request, operation: str
       }
 
       const order = data as any;
-      const { error: finalizeError } = await c.supabase
-        .from("ai_working_orders")
+      const { error: finalizeError } = await workingOrders(c)
         .update({ status: "created", created_order_id: order?.id ?? null, updated_at: new Date().toISOString() })
         .eq("id", state.id)
         .eq("revision", state.revision)
