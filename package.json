@@ -7,7 +7,8 @@
     "build": "next build --no-lint",
     "start": "next start",
     "lint": "next lint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:working-order": "rm -rf .test-dist && tsc -p tsconfig.tests.json && node --test .test-dist/tests/working-order-core.test.js"
   },
   "dependencies": {
     "@supabase/ssr": "^0.10.0",
