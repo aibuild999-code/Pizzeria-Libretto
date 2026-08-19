@@ -89,6 +89,8 @@ jobs:
           exit 1
       - name: Run signed Retell-shaped HTTP simulation
         run: node tests/http-retell-simulation.mjs
+      - name: Run adversarial Retell-shaped HTTP cases
+        run: node tests/http-edge-simulation.mjs
       - name: Show server logs on failure
         if: failure()
         run: |
