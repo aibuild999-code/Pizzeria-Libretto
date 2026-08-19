@@ -1,4 +1,5 @@
 export type SelectionAction = "add" | "remove";
+export type SelectionSide = "whole" | "left" | "right";
 
 export type WorkingSelection = {
   modifier_id: string;
@@ -6,9 +7,11 @@ export type WorkingSelection = {
   modifier_group_id: string;
   action: SelectionAction;
   quantity?: number;
-  side?: "whole" | "left" | "right";
+  side?: SelectionSide;
   quantity_level_id?: string;
   notes?: string;
+  target_ingredient_id?: string;
+  replacement_ingredient_id?: string;
   substitutes_for_modifier_id?: string;
   substitutes_for_name?: string;
 };
@@ -16,6 +19,7 @@ export type WorkingSelection = {
 export type WorkingRequirement = {
   modifier_group_id: string;
   group_name: string;
+  selection_type: "single" | "multiple";
   min_selections: number;
   max_selections: number | null;
 };
@@ -52,7 +56,7 @@ export type WorkingOrderState = {
 };
 
 export type ResolvedModifierChange =
-  | { operation: "remove"; modifier_name: string }
+  | { operation: "remove"; modifier_name: string; modifier_group_id?: string }
   | { operation: "add"; selection: WorkingSelection };
 
 export function normalizeName(value: string) {
@@ -64,32 +68,61 @@ export function appendLine(items: WorkingLine[], line: WorkingLine): WorkingLine
   return [...items, line];
 }
 
+function ruleFor(requirements: WorkingRequirement[], groupId: string) {
+  return requirements.find((requirement) => requirement.modifier_group_id === groupId);
+}
+
+function validateSelectionLimits(selections: WorkingSelection[], requirements: WorkingRequirement[]) {
+  for (const requirement of requirements) {
+    const active = selections.filter((selection) =>
+      selection.modifier_group_id === requirement.modifier_group_id && selection.action === "add",
+    );
+    if (requirement.max_selections !== null && active.length > requirement.max_selections) {
+      throw new Error(`MODIFIER_SELECTION_LIMIT:${requirement.group_name}`);
+    }
+  }
+}
+
 export function applyModifierChanges(
   selections: WorkingSelection[],
   changes: ResolvedModifierChange[],
+  requirements: WorkingRequirement[] = [],
 ): WorkingSelection[] {
   let next = [...selections];
   for (const change of changes) {
     if (change.operation === "remove") {
       const name = normalizeName(change.modifier_name);
-      next = next.filter((selection) => normalizeName(selection.modifier_name) !== name);
+      next = next.filter((selection) => {
+        if (change.modifier_group_id && selection.modifier_group_id !== change.modifier_group_id) return true;
+        return normalizeName(selection.modifier_name) !== name;
+      });
       continue;
     }
 
     const selection = change.selection;
+    const rule = ruleFor(requirements, selection.modifier_group_id);
+
     if (selection.substitutes_for_modifier_id || selection.substitutes_for_name) {
       next = next.filter((current) => {
+        if (current.modifier_group_id !== selection.modifier_group_id) return true;
         if (selection.substitutes_for_modifier_id && current.modifier_id === selection.substitutes_for_modifier_id) return false;
         if (selection.substitutes_for_name && normalizeName(current.modifier_name) === normalizeName(selection.substitutes_for_name)) return false;
         return true;
       });
     }
 
-    const sameGroup = next.filter((current) => current.modifier_group_id === selection.modifier_group_id);
-    if (selection.substitutes_for_modifier_id || selection.substitutes_for_name || sameGroup.some((current) => current.modifier_id === selection.modifier_id)) {
+    const sameModifier = (current: WorkingSelection) =>
+      current.modifier_group_id === selection.modifier_group_id && current.modifier_id === selection.modifier_id;
+
+    // Repeating or refining one topping should only replace that exact selection.
+    // Single-choice groups replace the current group selection; multi-select groups preserve peers.
+    if (rule?.selection_type === "single" || rule?.max_selections === 1) {
       next = next.filter((current) => current.modifier_group_id !== selection.modifier_group_id);
+    } else {
+      next = next.filter((current) => !sameModifier(current));
     }
-    if (!next.some((current) => current.modifier_id === selection.modifier_id)) next.push(selection);
+    next.push(selection);
+    validateSelectionLimits(next, requirements);
   }
   return next;
 }
@@ -116,9 +149,17 @@ export function updateLine(
     size_name: patch.size_name ?? current.size_name,
     special_instructions: patch.special_instructions ?? current.special_instructions,
     selections: patch.modifier_changes
-      ? applyModifierChanges(current.selections, patch.modifier_changes)
+      ? applyModifierChanges(current.selections, patch.modifier_changes, current.requirements)
       : current.selections,
   };
+  return next;
+}
+
+export function replaceLineItem(items: WorkingLine[], lineId: string, replacement: Omit<WorkingLine, "line_id">): WorkingLine[] {
+  const index = items.findIndex((item) => item.line_id === lineId);
+  if (index < 0) throw new Error("LINE_ITEM_NOT_FOUND");
+  const next = [...items];
+  next[index] = { line_id: lineId, ...replacement };
   return next;
 }
 
@@ -129,17 +170,21 @@ export function removeLine(items: WorkingLine[], lineId: string): WorkingLine[] 
 }
 
 export function lineReadiness(line: WorkingLine) {
-  const missing = line.requirements
+  const problems = line.requirements
     .map((requirement) => {
       const count = line.selections.filter(
         (selection) => selection.modifier_group_id === requirement.modifier_group_id && selection.action === "add",
       ).length;
-      return count < requirement.min_selections
-        ? { ...requirement, selected: count, missing: requirement.min_selections - count }
-        : null;
+      if (count < requirement.min_selections) {
+        return { ...requirement, selected: count, missing: requirement.min_selections - count, problem: "MIN_NOT_MET" as const };
+      }
+      if (requirement.max_selections !== null && count > requirement.max_selections) {
+        return { ...requirement, selected: count, excess: count - requirement.max_selections, problem: "MAX_EXCEEDED" as const };
+      }
+      return null;
     })
     .filter(Boolean);
-  return { ready: missing.length === 0, missing };
+  return { ready: problems.length === 0, missing: problems };
 }
 
 export function orderReadiness(items: WorkingLine[]) {
@@ -151,9 +196,7 @@ export function orderReadiness(items: WorkingLine[]) {
   return { ready: pending.length === 0, reason: pending.length ? "MISSING_REQUIRED_SELECTIONS" : null, pending };
 }
 
-export function invalidateQuote<T extends Pick<WorkingOrderState, "revision" | "status" | "quoted_revision" | "quote_token" | "quote_payload" | "quote_result">>(
-  state: T,
-) {
+export function invalidateQuote<T extends Pick<WorkingOrderState, "revision" | "status" | "quoted_revision" | "quote_token" | "quote_payload" | "quote_result">>(state: T) {
   return {
     ...state,
     revision: state.revision + 1,
