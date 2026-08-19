@@ -24,6 +24,10 @@ jobs:
           --health-retries 10
     env:
       TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/restaurant_ai_test
+      NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:3001
+      RETELL_API_KEY: local-retell-signature-secret-only-for-ci
+      TEST_JWT_SECRET: local-postgrest-jwt-secret-that-is-long-enough-2026
+      TEST_APP_URL: http://127.0.0.1:3000
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -40,6 +44,51 @@ jobs:
         run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/working-order.integration.sql
       - name: Attack simultaneous update and create races
         run: bash tests/run-concurrency-tests.sh
+      - name: Install local quote/create RPC equivalents for HTTP simulation
+        run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/http-rpc-fixture.sql
+      - name: Generate local service-role JWT
+        shell: bash
+        run: |
+          TOKEN=$(node - <<'NODE'
+          const crypto = require('crypto');
+          const secret = process.env.TEST_JWT_SECRET;
+          const b64 = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
+          const header = b64({ alg: 'HS256', typ: 'JWT' });
+          const payload = b64({ role: 'service_role', exp: Math.floor(Date.now()/1000) + 3600 });
+          const body = `${header}.${payload}`;
+          const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+          process.stdout.write(`${body}.${sig}`);
+          NODE
+          )
+          echo "SUPABASE_SERVICE_ROLE_KEY=$TOKEN" >> "$GITHUB_ENV"
+      - name: Start disposable PostgREST API
+        shell: bash
+        run: |
+          docker run -d --name local-postgrest --network host \
+            -e PGRST_DB_URI="postgres://postgres:postgres@127.0.0.1:5432/restaurant_ai_test" \
+            -e PGRST_DB_SCHEMAS="public" \
+            -e PGRST_DB_ANON_ROLE="anon" \
+            -e PGRST_JWT_SECRET="$TEST_JWT_SECRET" \
+            -e PGRST_SERVER_PORT="3001" \
+            postgrest/postgrest:v14.16
+          for i in {1..30}; do curl -fsS http://127.0.0.1:3001/ >/dev/null && exit 0; sleep 1; done
+          docker logs local-postgrest
+          exit 1
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build
+      - name: Start local Next.js server
+        shell: bash
+        run: |
+          npm start >/tmp/next.log 2>&1 &
+          echo $! >/tmp/next.pid
+          for i in {1..30}; do curl -fsS http://127.0.0.1:3000/ >/dev/null && exit 0; sleep 1; done
+          cat /tmp/next.log
+          exit 1
+      - name: Run signed Retell-shaped HTTP simulation
+        run: node tests/http-retell-simulation.mjs
+      - name: Show server logs on failure
+        if: failure()
+        run: |
+          cat /tmp/next.log 2>/dev/null || true
+          docker logs local-postgrest 2>/dev/null || true
