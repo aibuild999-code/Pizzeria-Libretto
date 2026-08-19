@@ -42,8 +42,8 @@ export type WorkingOrderState = {
   revision: number;
   quoted_revision: number | null;
   quote_token: string | null;
-  quote_payload: Record<string, unknown> | null;
-  quote_result: Record<string, unknown> | null;
+  quote_payload: Record<string, any> | null;
+  quote_result: Record<string, any> | null;
   status: "building" | "quoted" | "creating" | "created" | "abandoned";
   created_order_id: string | null;
   expires_at: string;
@@ -85,7 +85,6 @@ export function applyModifierChanges(
       });
     }
 
-    // One active selection per modifier group when a replacement/substitution is made.
     const sameGroup = next.filter((current) => current.modifier_group_id === selection.modifier_group_id);
     if (selection.substitutes_for_modifier_id || selection.substitutes_for_name || sameGroup.some((current) => current.modifier_id === selection.modifier_id)) {
       next = next.filter((current) => current.modifier_group_id !== selection.modifier_group_id);
