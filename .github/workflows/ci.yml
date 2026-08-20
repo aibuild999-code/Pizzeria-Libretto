@@ -110,8 +110,12 @@ jobs:
           cat /tmp/next.log
           exit 1
       - name: Run signed Retell-shaped HTTP simulation
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:3001/rest/v1
         run: node tests/http-retell-simulation.mjs
       - name: Run adversarial Retell-shaped HTTP cases
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:3001/rest/v1
         run: node tests/http-edge-simulation.mjs
       - name: Show server logs on failure
         if: failure()
